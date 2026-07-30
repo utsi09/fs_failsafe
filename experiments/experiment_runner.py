@@ -61,6 +61,7 @@ STUCK_CONFIRM_S = 60.0          # stopped this long without MRM state -> stuck
 # red-light wait en route to the shoulder can exceed 60 s — give MRM_MOVE
 # three full cycles before calling it stuck
 MRM_MOVE_STUCK_S = 150.0
+CARLA_RESTART_EVERY = 5    # cases between preemptive CARLA restarts
 
 # ---------------------------------------------------------------- case matrix
 # per-fault severity values (units differ: ln meters, cn pixel sigma 0-255,
@@ -279,7 +280,7 @@ def restart_carla(dry):
     return False
 
 
-def ego_alive(dry, timeout=90.0):
+def ego_alive(dry, timeout=180.0):
     """Wait until the leaderboard has spawned the ego (odometry flowing)."""
     if dry:
         return True
@@ -530,7 +531,10 @@ class Judge:
         self._last_xy = None
 
     def shutdown(self):
-        self.rclpy.shutdown()
+        try:
+            self.rclpy.shutdown()
+        except Exception:
+            pass   # already shut down (Ctrl+C path)
 
 
 _MAP = None
@@ -611,9 +615,9 @@ def run(args):
         for i, case in enumerate(cases):
             if interrupted:
                 break
-            # UE4 leaks memory on every load_world; a preemptive restart every
-            # 40 cases beats waiting for the slow-then-crash phase
-            if i > 0 and i % 40 == 0 and not args.dry:
+            # UE4 leaks memory on every load_world; a preemptive restart
+            # beats waiting for the slow-then-crash phase
+            if i > 0 and i % CARLA_RESTART_EVERY == 0 and not args.dry:
                 restart_carla(False)
             if not args.dry and not (carla_alive() and carla_responsive(False)
                                      and carla_unstick(False)):

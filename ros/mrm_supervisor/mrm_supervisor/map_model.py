@@ -172,6 +172,13 @@ class MapModel:
             if ll["subtype"] != "road_shoulder":
                 continue
             c = ll["center"]
+            # feasibility: a moving lateral-shift pull-over cannot fit into a
+            # pocket shorter than ~car + shift run-in (observed: 6.3 m pocket
+            # -> goal_planner "generated 0 pull over path candidates" forever,
+            # 7.8 m pocket -> parks fine)
+            pocket_len = sum(math.dist(c[i], c[i + 1]) for i in range(len(c) - 1))
+            if pocket_len < 7.0:
+                continue
             # position: true middle of the lanelet; yaw: overall start->end
             # direction (a mid/mid+1 segment degenerates on 2-point centerlines)
             if len(c) > 2:
