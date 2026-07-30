@@ -76,7 +76,7 @@ SEV_LEVELS = ["mid", "high"]
 # noise; cf: camera destroyed; lf: front lidar destroyed; nf: no-fault control
 FAULT_KINDS = ["ln", "cn", "imn", "gn", "cf", "lf", "nf"]
 NO_SEVERITY = {"cf", "lf", "nf"}  # no severity dimension (nf: no trigger either)
-TRIGGER_TIMES = [20, 40]
+TRIGGER_TIMES = [10, 30]
 NPC_STYLES = ["def", "agg"]
 METHODS = ["ours", "baseline"]      # baseline = stock Autoware MRM (in-lane stop)
 REPEATS = 15
@@ -331,9 +331,14 @@ class Judge:
         self.pose = None
         self.speed = None
         self.stopped_since = None
+        self.stationary_since = None
         self.moved = False
         self.aw_state = 0              # MrmState.state from mrm_handler
         self.aw_behaviors = []         # behavior names in first-seen order
+        self.fault_time = None         # wall time the fault went live
+        self.deg_dist = 0.0            # meters driven after the fault
+        self.min_gap = None            # nearest obstacle while stationary post-fault
+        self._last_xy = None
 
         self.node.create_subscription(
             String, "/mrm_supervisor/state", self._state_cb,
@@ -348,9 +353,28 @@ class Judge:
         self.node.create_subscription(
             OperationModeState, "/api/operation_mode/state", self._op_cb,
             QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        from std_msgs.msg import Bool, Float64
+        self.node.create_subscription(
+            Bool, "/fault_injection/active", self._fault_cb,
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        self.node.create_subscription(
+            Float64, "/monitor/nearest_obstacle_m", self._gap_cb, 10)
 
         self._spin = threading.Thread(target=self._spin_loop, daemon=True)
         self._spin.start()
+
+    def _fault_cb(self, msg):
+        if msg.data and self.fault_time is None:
+            self.fault_time = time.time()
+            print("[judge] fault active")
+
+    def _gap_cb(self, msg):
+        # near-miss metric: closest object while stopped after the fault
+        # (rear traffic closing in on an in-lane MRM stop)
+        if (self.fault_time is not None and self.speed is not None
+                and self.speed < 0.5 and msg.data < 900.0):
+            if self.min_gap is None or msg.data < self.min_gap:
+                self.min_gap = msg.data
 
     OP_MODE_NAMES = {0: "UNKNOWN", 1: "STOP", 2: "AUTONOMOUS", 3: "LOCAL", 4: "REMOTE"}
 
@@ -390,6 +414,18 @@ class Judge:
         self.pose = (msg.pose.pose.position.x, msg.pose.pose.position.y)
         self.speed = math.hypot(msg.twist.twist.linear.x, msg.twist.twist.linear.y)
         now = time.time()
+        if self.fault_time is not None and self._last_xy is not None:
+            step = math.dist(self.pose, self._last_xy)
+            if step < 5.0:                  # ignore teleports/resets
+                self.deg_dist += step
+        self._last_xy = self.pose
+        # stationary time independent of `moved`: a fault can hit before the
+        # ego ever moves (red light at spawn) and the case must still close
+        if self.speed < STOPPED_SPEED:
+            if self.stationary_since is None:
+                self.stationary_since = now
+        else:
+            self.stationary_since = None
         if self.speed > 1.0 and not self.moved:
             self.moved = True
             self.aw_behaviors = []   # drop startup-phase MRM noise from the record
@@ -411,6 +447,7 @@ class Judge:
                       f"speed={self.speed if self.speed is not None else 'no-odom'} "
                       f"mode={self.op_mode or '?'}")
             stopped_for = (now - self.stopped_since) if self.stopped_since else 0.0
+            stationary_for = (now - self.stationary_since) if self.stationary_since else 0.0
 
             # supervisor publishes "STATE:target", e.g. "MRM_PARKED:shoulder_X"
             if self.state.startswith("MRM_PARKED"):
@@ -426,7 +463,7 @@ class Judge:
                     and stopped_for > 5.0):
                 behavior = self.aw_behaviors[-1] if self.aw_behaviors else "UNKNOWN"
                 return f"AW_{behavior}_DONE", self._detail()
-            if self.state.startswith("MRM_DEFER") and stopped_for > DEFER_STOP_CONFIRM_S:
+            if self.state.startswith("MRM_DEFER") and stationary_for > DEFER_STOP_CONFIRM_S:
                 return "DEFER_STOPPED", self._detail()
             if lb_proc is not None and lb_proc.poll() is not None:
                 # judge can miss latched states (observed once after a DDS
@@ -461,8 +498,19 @@ class Judge:
         t_move = self.state_times.get("MRM_MOVE")
         t_end = self.stopped_since or time.time()
         tts = (t_end - t_move) if t_move else float("nan")
+        det, tts_fault = "", ""
+        if self.fault_time is not None:
+            mrm_ts = [t for s_, t in self.state_times.items()
+                      if s_.startswith("MRM_") and t >= self.fault_time - 1.0]
+            if mrm_ts:
+                det = round(min(mrm_ts) - self.fault_time, 1)
+            if self.stationary_since is not None:
+                tts_fault = round(self.stationary_since - self.fault_time, 1)
         return {"final_state": self.state, "x": round(px, 1), "y": round(py, 1),
                 "time_to_stop_s": round(tts, 1) if not math.isnan(tts) else "",
+                "det_latency_s": det, "tts_fault_s": tts_fault,
+                "deg_dist_m": round(self.deg_dist, 1) if self.fault_time else "",
+                "min_gap_m": round(self.min_gap, 1) if self.min_gap is not None else "",
                 "aw_mrm": "+".join(self.aw_behaviors)}
 
     def reset(self):
@@ -471,13 +519,53 @@ class Judge:
         self.pose = None
         self.speed = None
         self.stopped_since = None
+        self.stationary_since = None
         self.moved = False
         self.aw_state = 0
         self.aw_behaviors = []
         self.op_mode = None
+        self.fault_time = None
+        self.deg_dist = 0.0
+        self.min_gap = None
+        self._last_xy = None
 
     def shutdown(self):
         self.rclpy.shutdown()
+
+
+_MAP = None
+
+
+def lane_occupancy(x, y):
+    """(overlap_m, block_pct): how much of the 1.9 m-wide ego footprint lies
+    inside the nearest DRIVING lane at the final stop pose. 0 = fully clear
+    (shoulder), 100% of lane width = fully blocking. Narrow Town07 shoulders
+    (1.6-2.4 m) force partial overlaps — this measures them continuously."""
+    global _MAP
+    try:
+        if _MAP is None:
+            import sys
+            sys.path.insert(0, "/home/taewook/fs_ws/src/mrm_supervisor")
+            from mrm_supervisor.map_model import MapModel
+            _MAP = MapModel("/home/taewook/awcl_maps/Town07/lanelet2_map.osm")
+        lid = _MAP.nearest_road_lanelet(x, y)
+        ll = _MAP.lanelets[lid]
+        c = ll["center"]
+        # lateral offset from the centerline (nearest vertex is enough at
+        # the ~1 m fidelity we need)
+        lat = min(math.dist((x, y), p) for p in c)
+        lpts = _MAP._ways.get(ll["left"], [])
+        rpts = _MAP._ways.get(ll["right"], [])
+        if not lpts or not rpts:
+            return "", ""
+        lp = min(lpts, key=lambda p: math.dist((x, y), p))
+        rp = min(rpts, key=lambda p: math.dist((x, y), p))
+        width = math.dist(lp, rp)
+        half_car = 0.95
+        overlap = max(0.0, min(lat + half_car, width / 2) - max(lat - half_car, -width / 2))
+        return round(overlap, 2), round(100.0 * overlap / width, 1)
+    except Exception:
+        return "", ""
 
 
 def parse_infractions():
@@ -516,6 +604,8 @@ def run(args):
         wr = csv.writer(f)
         wr.writerow(["idx", "method", "fault", "severity", "trigger_s", "npc", "rep",
                      "outcome", "final_state", "aw_mrm", "stop_x", "stop_y",
+                     "lane_overlap_m", "lane_block_pct",
+                     "det_latency_s", "tts_fault_s", "deg_dist_m", "min_gap_m",
                      "time_to_stop_s", "collisions", "collision_types", "wall_s"])
         interrupted = False
         for i, case in enumerate(cases):
@@ -572,10 +662,14 @@ def run(args):
 
             wall = round(time.time() - t0, 1)
             n_coll, coll_types = parse_infractions()
+            sx, sy = detail.get("x", ""), detail.get("y", "")
+            ov, pct = lane_occupancy(sx, sy) if isinstance(sx, float) and not math.isnan(sx) else ("", "")
             row = [i, case["method"], case["fault"], case["sev"], case["t"],
                    case["npc"], case["rep"],
                    outcome, detail.get("final_state", ""), detail.get("aw_mrm", ""),
-                   detail.get("x", ""), detail.get("y", ""),
+                   sx, sy, ov, pct,
+                   detail.get("det_latency_s", ""), detail.get("tts_fault_s", ""),
+                   detail.get("deg_dist_m", ""), detail.get("min_gap_m", ""),
                    detail.get("time_to_stop_s", ""),
                    n_coll, coll_types, wall]
             wr.writerow(row)

@@ -1,5 +1,5 @@
 diff --git a/src/tum_agents/autoware_agent/aw_e2e.py b/src/tum_agents/autoware_agent/aw_e2e.py
-index 1b56a0a..fc1b283 100644
+index 1b56a0a..fa005db 100644
 --- a/src/tum_agents/autoware_agent/aw_e2e.py
 +++ b/src/tum_agents/autoware_agent/aw_e2e.py
 @@ -9,6 +9,7 @@ This module provides a ROS autonomous agent interface to control the ego vehicle
@@ -28,7 +28,11 @@ index 1b56a0a..fc1b283 100644
  
  def get_entry_point():
      return 'AutowareE2EAgent'
-@@ -115,9 +118,14 @@ class AutowareE2EAgent(TUMROSBaseAgent):
+@@ -112,12 +115,18 @@ class AutowareE2EAgent(TUMROSBaseAgent):
+         # Publisher & Subscriber for Goal Planning
+         self._goal_publisher = self.ros_node.create_publisher(PoseStamped, "/rviz/routing/rough_goal", qos_profile=QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+         self._engage_publisher = self.ros_node.create_publisher(Engage, "/autoware/engage", qos_profile=QoSProfile(depth=1, durability=DurabilityPolicy.VOLATILE))
++        self._fault_active_pub = self.ros_node.create_publisher(Bool, "/fault_injection/active", qos_profile=QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
          self._autoware_mode_subscriber = self.ros_node.create_subscription(OperationModeState, "/system/operation_mode/state", self._operation_mode_callback, qos_profile=QoSProfile(depth=1, durability=DurabilityPolicy.VOLATILE))
          # Services for Goal Publishing
          self._route_service_client = self.ros_node.create_client(SetRoutePoints, "/api/routing/change_route_points")
@@ -44,7 +48,7 @@ index 1b56a0a..fc1b283 100644
  
          self._object_publisher = self.ros_node.create_publisher(PredictedObjects, "/perception/object_recognition/objects", qos_profile=QoSProfile(depth=1, durability=DurabilityPolicy.VOLATILE))
  
-@@ -161,12 +169,53 @@ class AutowareE2EAgent(TUMROSBaseAgent):
+@@ -161,12 +170,55 @@ class AutowareE2EAgent(TUMROSBaseAgent):
          self._is_autonomous = False
          self._pending_service_call = False
          self._route_extended = False
@@ -84,6 +88,8 @@ index 1b56a0a..fc1b283 100644
 +        self._camera_killed = False
 +        self._lidar_killed = False
 +        self._tail_spawned = False
++        self._tail_actor = None
++        self._fault_announced = False
 +        self._bridge_noise_started = set()
 +        # npc=agg: make background traffic aggressive via the TrafficManager
 +        self._npc_styled = False
@@ -100,7 +106,7 @@ index 1b56a0a..fc1b283 100644
          self._traffic_light_ids = set()  
  
          self._steps_before_init = 0
-@@ -201,13 +250,189 @@ class AutowareE2EAgent(TUMROSBaseAgent):
+@@ -201,13 +253,218 @@ class AutowareE2EAgent(TUMROSBaseAgent):
  
          return sensors
  
@@ -168,13 +174,20 @@ index 1b56a0a..fc1b283 100644
          self._counter += 1
 +
 +        # --- Fault injection (research) ---
-+        # t counts from AUTONOMOUS engagement, not scenario start: boot eats
-+        # 40-50 s, so counting from scenario start made "t=60" hit ~10 s into
-+        # the actual drive and look like a pre-fault MRM.
++        # t counts from the moment the ego actually STARTS DRIVING (engaged
++        # AND moving): counting from engagement made t elapse while waiting
++        # at a red light, injecting faults into a parked car.
 +        if self._fault_t0 is None:
++            moving = False
 +            if self._is_autonomous:
++                try:
++                    ego = CarlaDataProvider.get_hero_actor()
++                    moving = ego is not None and ego.get_velocity().length() > 1.0
++                except Exception:
++                    pass
++            if moving:
 +                self._fault_t0 = timestamp
-+                print(f"[FAULT INJECTION] timer armed at sim {timestamp:.1f}s (engaged)")
++                print(f"[FAULT INJECTION] timer armed at sim {timestamp:.1f}s (driving)")
 +            fault_elapsed = -1.0
 +        else:
 +            fault_elapsed = timestamp - self._fault_t0
@@ -212,15 +225,31 @@ index 1b56a0a..fc1b283 100644
 +                    print("[FAULT INJECTION] camera destroy failed:", e)
 +                self._camera_killed = True
 +
-+        # tail=<gap_m>: spawn a chasing NPC <gap_m> behind the ego once driving
-+        if not self._tail_spawned and self._is_autonomous and self._counter > 40:
-+            tail_env = self.ros_node.get_parameter("tail").value
-+            if tail_env:
-+                self._tail_spawned = True
-+                try:
-+                    gap = float(tail_env)
-+                    world = CarlaDataProvider.get_world()
-+                    ego = CarlaDataProvider.get_hero_actor()
++        # tail=<gap_m>: keep a chasing NPC behind the ego for the WHOLE case.
++        # A one-shot spawn drifts away (the TM picks its own turns at
++        # junctions) — re-check every ~5 s and respawn when lost/far.
++        if (self._is_autonomous and self._counter > 40
++                and self._counter % 100 == 0
++                and self.ros_node.get_parameter("tail").value):
++            try:
++                gap = float(self.ros_node.get_parameter("tail").value)
++                world = CarlaDataProvider.get_world()
++                ego = CarlaDataProvider.get_hero_actor()
++                tail_ok = False
++                if self._tail_actor is not None:
++                    try:
++                        tail_ok = (self._tail_actor.is_alive and
++                                   self._tail_actor.get_location().distance(
++                                       ego.get_location()) < 60.0)
++                    except Exception:
++                        tail_ok = False
++                if not tail_ok:
++                    if self._tail_actor is not None:
++                        try:
++                            self._tail_actor.destroy()
++                        except Exception:
++                            pass
++                        self._tail_actor = None
 +                    wp = CarlaDataProvider.get_map().get_waypoint(ego.get_location())
 +                    prev = wp.previous(gap)
 +                    if prev:
@@ -239,14 +268,11 @@ index 1b56a0a..fc1b283 100644
 +                            tm.vehicle_percentage_speed_difference(
 +                                npc, -30.0 if aggressive else -10.0)
 +                            tm.ignore_lights_percentage(npc, 30.0 if aggressive else 0.0)
-+                            print(f"[TAIL NPC] spawned {gap:.0f}m behind ego"
++                            self._tail_actor = npc
++                            print(f"[TAIL NPC] (re)spawned {gap:.0f}m behind ego"
 +                                  f" (aggressive={aggressive})")
-+                        else:
-+                            print("[TAIL NPC] spawn blocked (occupied), skipping")
-+                    else:
-+                        print("[TAIL NPC] no lane waypoint behind ego, skipping")
-+                except Exception as e:
-+                    print("[TAIL NPC] spawn failed:", e)
++            except Exception as e:
++                print("[TAIL NPC] ensure failed:", e)
 +
 +        # lf=<t>: destroy the FRONT lidar actor — topic goes silent, the
 +        # monitor's timeout checker (not the noise checker) must catch it
@@ -289,10 +315,19 @@ index 1b56a0a..fc1b283 100644
 +        spec = self._parse_fault(self.ros_node.get_parameter("gn").value, 1.0)
 +        self._gnss_noise_sigma = spec[1] if spec and fault_elapsed >= spec[0] else 0.0
 +
++        # single latched "fault is now live" signal for the experiment judge
++        if not self._fault_announced and (
++                self._bridge_noise_started or self._camera_killed
++                or self._lidar_killed or self._imu_noise_sigma > 0.0
++                or self._gnss_noise_sigma > 0.0):
++            self._fault_announced = True
++            self._fault_active_pub.publish(Bool(data=True))
++            print(f"[FAULT INJECTION] fault ACTIVE at t+{fault_elapsed:.1f}s (announced)")
++
          # Autoware Timing
          if self._aw_time is None:
              self._steps_before_init += 1
-@@ -227,6 +452,9 @@ class AutowareE2EAgent(TUMROSBaseAgent):
+@@ -227,6 +484,9 @@ class AutowareE2EAgent(TUMROSBaseAgent):
          ndt_pose_msg.header.frame_id = "map"
          ndt_pose_msg.pose.pose.position = Point(**position["position"])
          ndt_pose_msg.pose.pose.orientation = Quaternion(**position["orientation"])
@@ -302,7 +337,7 @@ index 1b56a0a..fc1b283 100644
          self._gnss_pose_pub.publish(ndt_pose_msg)
  
          # Steering Angle
-@@ -266,6 +494,14 @@ class AutowareE2EAgent(TUMROSBaseAgent):
+@@ -266,6 +526,14 @@ class AutowareE2EAgent(TUMROSBaseAgent):
              z=velocity["orientation"]["yaw"]
          )
          imu_msg.linear_acceleration = Vector3(**loc_acc["position"])
@@ -317,7 +352,7 @@ index 1b56a0a..fc1b283 100644
          self._imu_pub.publish(imu_msg)
          
          if self._use_v2x_traffic_light:
-@@ -303,9 +539,11 @@ class AutowareE2EAgent(TUMROSBaseAgent):
+@@ -303,9 +571,11 @@ class AutowareE2EAgent(TUMROSBaseAgent):
          except queue.Empty:
              control_timestamp, control = timestamp, self._last_control
  
@@ -332,7 +367,7 @@ index 1b56a0a..fc1b283 100644
  
          return control
  
-@@ -314,7 +552,7 @@ class AutowareE2EAgent(TUMROSBaseAgent):
+@@ -314,7 +584,7 @@ class AutowareE2EAgent(TUMROSBaseAgent):
          return AutowareE2EAgent.ROS_VERSION
  
      def set_global_plan(self, global_plan_gps, global_plan_world_coord):
@@ -341,7 +376,7 @@ index 1b56a0a..fc1b283 100644
          
          # Ensure the last waypoint is included
          if ds_ids[-1] != len(global_plan_world_coord) - 1:
-@@ -343,7 +581,15 @@ class AutowareE2EAgent(TUMROSBaseAgent):
+@@ -343,7 +613,15 @@ class AutowareE2EAgent(TUMROSBaseAgent):
  
          return (current_wp.transform, global_plan_world_coord[-1][1])
  
@@ -357,7 +392,7 @@ index 1b56a0a..fc1b283 100644
          if not self._global_plan_world_coord:
              return
  
-@@ -359,6 +605,14 @@ class AutowareE2EAgent(TUMROSBaseAgent):
+@@ -359,6 +637,14 @@ class AutowareE2EAgent(TUMROSBaseAgent):
                  return  
  
          total_waypoints = len(self._global_plan_world_coord)
@@ -372,7 +407,7 @@ index 1b56a0a..fc1b283 100644
          is_last_waypoint = self._route_index >= total_waypoints - 1
  
          # --- Advance route index based on distance ---
-@@ -401,23 +655,45 @@ class AutowareE2EAgent(TUMROSBaseAgent):
+@@ -401,23 +687,45 @@ class AutowareE2EAgent(TUMROSBaseAgent):
              # Final goal MUST be published via topic so Autoware registers scenario completion
              goal_pose_stamped = PoseStamped()
              goal_pose_stamped.header.frame_id = "map"
@@ -425,7 +460,7 @@ index 1b56a0a..fc1b283 100644
              service_request.goal = Pose(
                  position=Point(**next_pose_dict["position"]),
                  orientation=Quaternion(**next_pose_dict["orientation"])
-@@ -441,7 +717,7 @@ class AutowareE2EAgent(TUMROSBaseAgent):
+@@ -441,7 +749,7 @@ class AutowareE2EAgent(TUMROSBaseAgent):
                  self._published_latest = True
                  self._goal_mod_failure_counter = 0
  

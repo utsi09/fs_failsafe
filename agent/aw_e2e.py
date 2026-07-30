@@ -115,6 +115,7 @@ class AutowareE2EAgent(TUMROSBaseAgent):
         # Publisher & Subscriber for Goal Planning
         self._goal_publisher = self.ros_node.create_publisher(PoseStamped, "/rviz/routing/rough_goal", qos_profile=QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self._engage_publisher = self.ros_node.create_publisher(Engage, "/autoware/engage", qos_profile=QoSProfile(depth=1, durability=DurabilityPolicy.VOLATILE))
+        self._fault_active_pub = self.ros_node.create_publisher(Bool, "/fault_injection/active", qos_profile=QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self._autoware_mode_subscriber = self.ros_node.create_subscription(OperationModeState, "/system/operation_mode/state", self._operation_mode_callback, qos_profile=QoSProfile(depth=1, durability=DurabilityPolicy.VOLATILE))
         # Services for Goal Publishing
         self._route_service_client = self.ros_node.create_client(SetRoutePoints, "/api/routing/change_route_points")
@@ -205,6 +206,8 @@ class AutowareE2EAgent(TUMROSBaseAgent):
         self._camera_killed = False
         self._lidar_killed = False
         self._tail_spawned = False
+        self._tail_actor = None
+        self._fault_announced = False
         self._bridge_noise_started = set()
         # npc=agg: make background traffic aggressive via the TrafficManager
         self._npc_styled = False
@@ -312,13 +315,20 @@ class AutowareE2EAgent(TUMROSBaseAgent):
         self._counter += 1
 
         # --- Fault injection (research) ---
-        # t counts from AUTONOMOUS engagement, not scenario start: boot eats
-        # 40-50 s, so counting from scenario start made "t=60" hit ~10 s into
-        # the actual drive and look like a pre-fault MRM.
+        # t counts from the moment the ego actually STARTS DRIVING (engaged
+        # AND moving): counting from engagement made t elapse while waiting
+        # at a red light, injecting faults into a parked car.
         if self._fault_t0 is None:
+            moving = False
             if self._is_autonomous:
+                try:
+                    ego = CarlaDataProvider.get_hero_actor()
+                    moving = ego is not None and ego.get_velocity().length() > 1.0
+                except Exception:
+                    pass
+            if moving:
                 self._fault_t0 = timestamp
-                print(f"[FAULT INJECTION] timer armed at sim {timestamp:.1f}s (engaged)")
+                print(f"[FAULT INJECTION] timer armed at sim {timestamp:.1f}s (driving)")
             fault_elapsed = -1.0
         else:
             fault_elapsed = timestamp - self._fault_t0
@@ -356,15 +366,31 @@ class AutowareE2EAgent(TUMROSBaseAgent):
                     print("[FAULT INJECTION] camera destroy failed:", e)
                 self._camera_killed = True
 
-        # tail=<gap_m>: spawn a chasing NPC <gap_m> behind the ego once driving
-        if not self._tail_spawned and self._is_autonomous and self._counter > 40:
-            tail_env = self.ros_node.get_parameter("tail").value
-            if tail_env:
-                self._tail_spawned = True
-                try:
-                    gap = float(tail_env)
-                    world = CarlaDataProvider.get_world()
-                    ego = CarlaDataProvider.get_hero_actor()
+        # tail=<gap_m>: keep a chasing NPC behind the ego for the WHOLE case.
+        # A one-shot spawn drifts away (the TM picks its own turns at
+        # junctions) — re-check every ~5 s and respawn when lost/far.
+        if (self._is_autonomous and self._counter > 40
+                and self._counter % 100 == 0
+                and self.ros_node.get_parameter("tail").value):
+            try:
+                gap = float(self.ros_node.get_parameter("tail").value)
+                world = CarlaDataProvider.get_world()
+                ego = CarlaDataProvider.get_hero_actor()
+                tail_ok = False
+                if self._tail_actor is not None:
+                    try:
+                        tail_ok = (self._tail_actor.is_alive and
+                                   self._tail_actor.get_location().distance(
+                                       ego.get_location()) < 60.0)
+                    except Exception:
+                        tail_ok = False
+                if not tail_ok:
+                    if self._tail_actor is not None:
+                        try:
+                            self._tail_actor.destroy()
+                        except Exception:
+                            pass
+                        self._tail_actor = None
                     wp = CarlaDataProvider.get_map().get_waypoint(ego.get_location())
                     prev = wp.previous(gap)
                     if prev:
@@ -383,14 +409,11 @@ class AutowareE2EAgent(TUMROSBaseAgent):
                             tm.vehicle_percentage_speed_difference(
                                 npc, -30.0 if aggressive else -10.0)
                             tm.ignore_lights_percentage(npc, 30.0 if aggressive else 0.0)
-                            print(f"[TAIL NPC] spawned {gap:.0f}m behind ego"
+                            self._tail_actor = npc
+                            print(f"[TAIL NPC] (re)spawned {gap:.0f}m behind ego"
                                   f" (aggressive={aggressive})")
-                        else:
-                            print("[TAIL NPC] spawn blocked (occupied), skipping")
-                    else:
-                        print("[TAIL NPC] no lane waypoint behind ego, skipping")
-                except Exception as e:
-                    print("[TAIL NPC] spawn failed:", e)
+            except Exception as e:
+                print("[TAIL NPC] ensure failed:", e)
 
         # lf=<t>: destroy the FRONT lidar actor — topic goes silent, the
         # monitor's timeout checker (not the noise checker) must catch it
@@ -432,6 +455,15 @@ class AutowareE2EAgent(TUMROSBaseAgent):
         self._imu_noise_sigma = spec[1] if spec and fault_elapsed >= spec[0] else 0.0
         spec = self._parse_fault(self.ros_node.get_parameter("gn").value, 1.0)
         self._gnss_noise_sigma = spec[1] if spec and fault_elapsed >= spec[0] else 0.0
+
+        # single latched "fault is now live" signal for the experiment judge
+        if not self._fault_announced and (
+                self._bridge_noise_started or self._camera_killed
+                or self._lidar_killed or self._imu_noise_sigma > 0.0
+                or self._gnss_noise_sigma > 0.0):
+            self._fault_announced = True
+            self._fault_active_pub.publish(Bool(data=True))
+            print(f"[FAULT INJECTION] fault ACTIVE at t+{fault_elapsed:.1f}s (announced)")
 
         # Autoware Timing
         if self._aw_time is None:

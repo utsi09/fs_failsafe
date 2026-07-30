@@ -38,6 +38,8 @@ class AwclAdapter(Node):
         self._obstacle_pub = self.create_publisher(ObstacleArray, "/hesai_zed/obstacles", qos)
 
         self._ttc_pub = self.create_publisher(Float64, "/monitor/ttc_ms", qos)
+        # nearest-object gap for the experiment judge (near-miss metric)
+        self._gap_pub = self.create_publisher(Float64, "/monitor/nearest_obstacle_m", qos)
 
         self._ego_xy = None
         self._traj = None
@@ -84,6 +86,7 @@ class AwclAdapter(Node):
         self._obstacle_pub.publish(out)
 
         self._ttc_pub.publish(Float64(data=self._spacetime_ttc_ms(msg)))
+        self._gap_pub.publish(Float64(data=ob.distance))
 
     # ------------------------------------------------- spatio-temporal TTC
     def _ego_samples(self):

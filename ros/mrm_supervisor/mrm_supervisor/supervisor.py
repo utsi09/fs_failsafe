@@ -91,6 +91,8 @@ class Supervisor(Node):
         self.speed = 0.0
         self.loc_jump_score = 1.0
         self.loc_meas_score = 1.0  # raw GNSS/NDT pose vs EKF output residual
+        self._meas_base = 0.0      # static frame offset learned at boot
+        self._meas_n = 0
         self._last_odom = None
 
         self.state = "NORMAL"
@@ -156,10 +158,21 @@ class Supervisor(Node):
     def _meas_pose_cb(self, msg):
         if self.pose is None:
             return
-        # residual between the raw localization measurement and the EKF pose:
-        # ~0.1-0.3 m when healthy, ~sigma when gn noise is injected
+        # residual between the raw localization measurement and the EKF pose.
+        # There is a STATIC offset between the two (vehicle-center vs base_link,
+        # ~1.4 m) — learn it during boot (faults only fire after driving
+        # starts) and score only the EXCESS over that baseline.
         r = math.dist(self.pose, (msg.pose.pose.position.x, msg.pose.pose.position.y))
-        inst = math.exp(-max(0.0, r - 0.5) / 0.7)
+        if self._meas_n < 60:                     # ~3 s calibration window
+            self._meas_base = r if self._meas_n == 0 else \
+                0.9 * self._meas_base + 0.1 * r
+            self._meas_n += 1
+            return
+        excess = max(0.0, r - self._meas_base - 0.2)
+        # gn mid (sigma 1 m, excess ~0.3) -> ~0.58: degraded band, still above
+        # min_loc_to_move -> shoulder pull-over; gn high (sigma 2.5, excess
+        # ~1.6) -> ~0.05: floor -> DEFER
+        inst = math.exp(-excess / 0.55)
         self.loc_meas_score = 0.9 * self.loc_meas_score + 0.1 * inst
 
     def _odom_cb(self, msg):
