@@ -194,12 +194,29 @@ class MapModel:
         for wid, pts in self.parking_lots.items():
             cx = sum(p[0] for p in pts) / len(pts)
             cy = sum(p[1] for p in pts) / len(pts)
+            # lot polygons often OVERLAP the road, so the centroid can land on
+            # the carriageway (observed: "parked" blocking 51% of the lane).
+            # Use the interior point farthest from any road centerline instead,
+            # blended toward the centroid to stay inside the polygon.
+            def road_dist(p):
+                best = float("inf")
+                for ll in self.lanelets.values():
+                    if ll["subtype"] != "road":
+                        continue
+                    for q in ll["center"][::2]:
+                        d = (q[0] - p[0]) ** 2 + (q[1] - p[1]) ** 2
+                        if d < best:
+                            best = d
+                return math.sqrt(best)
+            gx, gy = max(
+                ((0.5 * (px + cx), 0.5 * (py + cy)) for px, py in pts),
+                key=road_dist)
             target = self.nearest_road_lanelet(cx, cy)
             if target is None:
                 continue
             tc = self.lanelets[target]["center"]
             yaw = math.atan2(tc[-1][1] - tc[0][1], tc[-1][0] - tc[0][0])
-            cands.append(Candidate("parking_lot", f"parking_{wid}", cx, cy, yaw,
+            cands.append(Candidate("parking_lot", f"parking_{wid}", gx, gy, yaw,
                                    target, parking_sectors))
 
         return cands
