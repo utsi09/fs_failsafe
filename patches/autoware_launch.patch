@@ -1,0 +1,150 @@
+diff --git a/autoware_launch/config/control/operation_mode_transition_manager/operation_mode_transition_manager.param.yaml b/autoware_launch/config/control/operation_mode_transition_manager/operation_mode_transition_manager.param.yaml
+index c362880..db9871f 100644
+--- a/autoware_launch/config/control/operation_mode_transition_manager/operation_mode_transition_manager.param.yaml
++++ b/autoware_launch/config/control/operation_mode_transition_manager/operation_mode_transition_manager.param.yaml
+@@ -5,7 +5,10 @@
+     frequency_hz: 10.0
+ 
+     # set true if you want to engage the autonomous driving mode while the vehicle is driving. If set to false, it will deny Engage in any situation where the vehicle speed is not zero. Note that if you use this feature without adjusting the parameters, it may cause issues like sudden deceleration. Before using, please ensure the engage condition and the vehicle_cmd_gate transition filter are appropriately adjusted.
+-    enable_engage_on_driving: false
++    # AWCL/MRM: the supervisor reroutes WHILE DRIVING; if the mode drops during
++    # the route change, engage-at-standstill-only deadlocks the run (observed:
++    # 28x "Engage unavailable ... not stationary", car finished on the old route)
++    enable_engage_on_driving: true
+ 
+     check_engage_condition: false # set false if you do not want to care about the engage condition.
+     nearest_dist_deviation_threshold: 3.0 # [m] for finding nearest index
+diff --git a/autoware_launch/config/perception/traffic_light_recognition/traffic_light_classifier/car_traffic_light_classifier.param.yaml b/autoware_launch/config/perception/traffic_light_recognition/traffic_light_classifier/car_traffic_light_classifier.param.yaml
+index fbba97b..9aceda2 100644
+--- a/autoware_launch/config/perception/traffic_light_recognition/traffic_light_classifier/car_traffic_light_classifier.param.yaml
++++ b/autoware_launch/config/perception/traffic_light_recognition/traffic_light_classifier/car_traffic_light_classifier.param.yaml
+@@ -4,7 +4,7 @@
+     precision: fp16
+     mean: [123.675, 116.28, 103.53] # It depends on the data on which ML model is trained
+     std: [58.395, 57.12, 57.375] # It depends on the data on which ML model is trained
+-    over_exposure_threshold: 0.85
++    over_exposure_threshold: 2.0
+     under_exposure_threshold: -0.83
+     classifier_type: 1
+     traffic_light_type: 0
+diff --git a/autoware_launch/config/planning/mission_planning/mission_planner/mission_planner.param.yaml b/autoware_launch/config/planning/mission_planning/mission_planner/mission_planner.param.yaml
+index a1ae147..9d976c8 100644
+--- a/autoware_launch/config/planning/mission_planning/mission_planner/mission_planner.param.yaml
++++ b/autoware_launch/config/planning/mission_planning/mission_planner/mission_planner.param.yaml
+@@ -8,9 +8,9 @@
+     arrival_check_longitudinal_overshoot_distance: 2.0
+     goal_angle_threshold_deg: 45.0
+     enable_correct_goal_pose: false
+-    reroute_time_threshold: 10.0
+-    minimum_reroute_length: 30.0
++    reroute_time_threshold: 2.0    # relaxed for MRM shoulder reroute (was 10.0)
++    minimum_reroute_length: 5.0    # relaxed for MRM shoulder reroute (was 30.0)
+     consider_no_drivable_lanes: false # This flag is for considering no_drivable_lanes in planning or not.
+-    check_footprint_inside_lanes: true
++    check_footprint_inside_lanes: false # allow goal footprint overhanging narrow shoulders (was true)
+     allow_reroute_in_autonomous_mode: true
+     goal_lanelet_transparency: 0.05 # Sets the transparency of the goal lanelet marker in RViz. Higher value makes the marker more visible.
+diff --git a/autoware_launch/config/planning/scenario_planning/lane_driving/behavior_planning/behavior_path_planner/goal_planner/goal_planner.param.yaml b/autoware_launch/config/planning/scenario_planning/lane_driving/behavior_planning/behavior_path_planner/goal_planner/goal_planner.param.yaml
+index fcb53df..8823aed 100644
+--- a/autoware_launch/config/planning/scenario_planning/lane_driving/behavior_planning/behavior_path_planner/goal_planner/goal_planner.param.yaml
++++ b/autoware_launch/config/planning/scenario_planning/lane_driving/behavior_planning/behavior_path_planner/goal_planner/goal_planner.param.yaml
+@@ -13,7 +13,7 @@
+         minimum_weighted_distance:
+           lateral_weight: 40.0
+         prioritize_goals_before_objects: true
+-        parking_policy: "left_side" # "left_side" or "right_side"
++        parking_policy: "right_side" # CARLA is right-hand traffic; shoulders are on the right (was "left_side")
+         forward_goal_search_length: 40.0
+         backward_goal_search_length: 20.0
+         goal_search_interval: 2.0
+@@ -21,7 +21,7 @@
+         max_lateral_offset: 1.0
+         lateral_offset_interval: 0.5
+         ignore_distance_from_lane_start: 0.0
+-        margin_from_boundary: 0.75
++        margin_from_boundary: 0.1 # relaxed for narrow (1.6-2.4m) CARLA shoulders (was 0.75)
+         high_curvature_threshold: 0.1
+         bus_stop_area:
+           use_bus_stop_area: false
+diff --git a/autoware_launch/config/system/diagnostics/autoware-carla.yaml b/autoware_launch/config/system/diagnostics/autoware-carla.yaml
+index 4f05e99..84a1ff6 100644
+--- a/autoware_launch/config/system/diagnostics/autoware-carla.yaml
++++ b/autoware_launch/config/system/diagnostics/autoware-carla.yaml
+@@ -45,6 +45,8 @@ units:
+       - { type: link, link: /autoware/vehicle }
+       - { type: link, link: /autoware/system }
+       - { type: link, link: /adapi/mrm_request/delegate }
++      - { type: link, link: /autoware/cdr/perception_score }
++      - { type: link, link: /autoware/cdr/supervisor_defer }
+ 
+   - path: /autoware/modes/pull_over
+     type: and
+@@ -123,6 +125,26 @@ units:
+     name: delegate
+     timeout: 3.0
+ 
++  # cdr_monitor dynamic-FTTI perception score (fs_ws thesis failsafe).
++  # ERROR (score <= 0.3) makes /autoware/modes/autonomous unavailable ->
++  # mrm_handler triggers MRM. WARN (0.3..0.7) stays available so the
++  # mrm_supervisor reroute owns that band. Requires cdr_monitor running,
++  # otherwise this unit goes stale and autonomous cannot engage.
++  - path: /autoware/cdr/perception_score
++    type: diag
++    node: cdr_monitor
++    name: sensing/perception_score
++    timeout: 3.0
++
++  # mrm_supervisor DEFER hand-over: ERROR while the supervisor is in
++  # MRM_DEFER (TL gate / low localization / score floor) so the stock
++  # mrm_handler takes over with comfortable/emergency stop.
++  - path: /autoware/cdr/supervisor_defer
++    type: diag
++    node: mrm_supervisor
++    name: defer_request
++    timeout: 3.0
++
+   # Planning units (without routing/state check for CARLA)
+   - path: /autoware/planning
+     type: and
+diff --git a/autoware_launch/config/system/diagnostics/control.yaml b/autoware_launch/config/system/diagnostics/control.yaml
+index 7a12d5a..e2de30f 100644
+--- a/autoware_launch/config/system/diagnostics/control.yaml
++++ b/autoware_launch/config/system/diagnostics/control.yaml
+@@ -5,7 +5,12 @@ units:
+       - { type: link, link: /autoware/control/topic_rate_check/trajectory_follower }
+       - { type: link, link: /autoware/control/topic_rate_check/control_command }
+       - { type: link, link: /autoware/control/node_alive_monitoring/command_gate }
+-      - { type: link, link: /autoware/control/emergency_braking }
++      # emergency_braking (AEB) intentionally NOT linked: injected lidar noise
++      # makes AEB see phantom obstacles -> control ERROR -> both autonomous and
++      # comfortable_stop become unavailable -> instant in-lane emergency stop,
++      # so the supervisor's shoulder pull-over can never run. The AEB diag unit
++      # below still exists and is visible in dumps, it just no longer gates
++      # the operation modes.
+       - { type: link, link: /autoware/control/performance_monitoring/lane_departure }
+       - { type: link, link: /autoware/control/performance_monitoring/control_state }
+ 
+diff --git a/autoware_launch/launch/e2e_simulator.launch.xml b/autoware_launch/launch/e2e_simulator.launch.xml
+index 83a7dec..7ca091f 100644
+--- a/autoware_launch/launch/e2e_simulator.launch.xml
++++ b/autoware_launch/launch/e2e_simulator.launch.xml
+@@ -7,6 +7,10 @@
+   <arg name="sensor_model" default="sample_sensor_kit" description="sensor model name"/>
+   <arg name="data_path" default="$(env HOME)/autoware_data" description="packages data and artifacts directory path"/>
+   <arg name="simulator_type" default="awsim" description="select the simulator type ('awsim' or 'carla')"/>
++  <!-- AWCL runs the cpp bridge instead of autoware_carla_interface, so
++       simulator_type stays 'awsim'; this selects just the diagnostics graph
++       (autoware-carla.yaml has CARLA-rate timeouts + cdr_monitor units). -->
++  <arg name="diagnostic_graph_type" default="$(var simulator_type)" description="diagnostics graph variant (autoware-&lt;type&gt;.yaml)"/>
+ 
+   <!-- launch module preset -->
+   <arg name="planning_module_preset" default="default" description="planning module preset"/>
+@@ -71,7 +75,7 @@
+       <!-- System -->
+       <arg name="launch_system_monitor" value="$(var launch_system_monitor)"/>
+       <arg name="launch_dummy_diag_publisher" value="$(var launch_dummy_diag_publisher)"/>
+-      <arg name="diagnostic_graph_aggregator_graph_path" value="$(find-pkg-share autoware_launch)/config/system/diagnostics/autoware-$(var simulator_type).yaml"/>
++      <arg name="diagnostic_graph_aggregator_graph_path" value="$(find-pkg-share autoware_launch)/config/system/diagnostics/autoware-$(var diagnostic_graph_type).yaml"/>
+       <!-- Sensing -->
+       <arg name="launch_sensing_driver" value="$(var launch_sensing_driver)"/>
+       <!-- Perception-->

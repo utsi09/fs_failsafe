@@ -1,0 +1,436 @@
+diff --git a/src/tum_agents/autoware_agent/aw_e2e.py b/src/tum_agents/autoware_agent/aw_e2e.py
+index 1b56a0a..fc1b283 100644
+--- a/src/tum_agents/autoware_agent/aw_e2e.py
++++ b/src/tum_agents/autoware_agent/aw_e2e.py
+@@ -9,6 +9,7 @@ This module provides a ROS autonomous agent interface to control the ego vehicle
+ 
+ 
+ from __future__ import print_function
++import os
+ import time
+ import threading
+ import queue
+@@ -31,7 +32,7 @@ from ackermann_msgs.msg import AckermannDrive
+ from diagnostic_msgs.msg import KeyValue, DiagnosticStatus
+ from geometry_msgs.msg import Point, Pose, Quaternion, Vector3, TransformStamped, AccelWithCovarianceStamped, PoseStamped, PoseWithCovarianceStamped, TwistWithCovarianceStamped
+ from sensor_msgs.msg import NavSatFix, Imu, PointCloud2, Image, CameraInfo
+-from std_msgs.msg import Bool
++from std_msgs.msg import Bool, String
+ from nav_msgs.msg import Odometry
+ from tf2_msgs.msg import TFMessage
+ from rosgraph_msgs.msg import Clock
+@@ -45,6 +46,8 @@ from autoware_control_msgs.msg import Control
+ from autoware_perception_msgs.msg import PredictedObjects, TrafficLightGroupArray, TrafficLightGroup, TrafficLightElement
+ from tier4_vehicle_msgs.msg import ActuationStatusStamped
+ from autoware_adapi_v1_msgs.srv import SetRoutePoints
++from rcl_interfaces.srv import SetParameters
++from rcl_interfaces.msg import Parameter as RclParameter, ParameterValue, ParameterType
+ 
+ def get_entry_point():
+     return 'AutowareE2EAgent'
+@@ -115,9 +118,14 @@ class AutowareE2EAgent(TUMROSBaseAgent):
+         self._autoware_mode_subscriber = self.ros_node.create_subscription(OperationModeState, "/system/operation_mode/state", self._operation_mode_callback, qos_profile=QoSProfile(depth=1, durability=DurabilityPolicy.VOLATILE))
+         # Services for Goal Publishing
+         self._route_service_client = self.ros_node.create_client(SetRoutePoints, "/api/routing/change_route_points")
++        # MRM supervisor owns the route while an MRM is active — stand down then
++        self._mrm_active = False
++        self._mrm_state_subscriber = self.ros_node.create_subscription(
++            String, "/mrm_supervisor/state", self._mrm_state_callback,
++            qos_profile=QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+         
+         # Subscriber for Control
+-        self._control_subscriber = self.ros_node.create_subscription(Control, "/control/trajectory_follower/control_cmd", self._vehicle_control_cmd_callback, qos_profile=QoSProfile(depth=1, durability=DurabilityPolicy.VOLATILE))
++        self._control_subscriber = self.ros_node.create_subscription(Control, "/control/command/control_cmd", self._vehicle_control_cmd_callback, qos_profile=QoSProfile(depth=1, durability=DurabilityPolicy.VOLATILE))
+ 
+         self._object_publisher = self.ros_node.create_publisher(PredictedObjects, "/perception/object_recognition/objects", qos_profile=QoSProfile(depth=1, durability=DurabilityPolicy.VOLATILE))
+ 
+@@ -161,12 +169,53 @@ class AutowareE2EAgent(TUMROSBaseAgent):
+         self._is_autonomous = False
+         self._pending_service_call = False
+         self._route_extended = False
++        # One-shot full-route setup (avoids mid-drive "cannot reroute")
++        self._bootstrap_goal_sent = False
++        self._route_sent = False
++        # Fault injection (research). All disabled unless given:
++        #   cf=20       destroy camera 20 s in (image freezes downstream)
++        #   cn=20:15    respawn camera at 20 s with gaussian pixel noise (sigma 15 on 0-255)
++        #   ln=20:0.1   respawn lidars at 20 s with CARLA-native noise_stddev=0.1 m
++        # Runtime override:
++        #   ros2 param set /autoware_e2e_node cf true
++        #   ros2 param set /autoware_e2e_node cn "0:15"      (0 = trigger now)
++        cf_env = os.environ.get("cf", "")
++        try:
++            cf_default = bool(cf_env)
++            cf_delay_default = float(cf_env) if cf_env else 20.0
++        except ValueError:
++            print(f"[FAULT INJECTION] invalid cf value {cf_env!r} — fault injection disabled")
++            cf_default, cf_delay_default = False, 20.0
++        if not self.ros_node.has_parameter("cf"):
++            self.ros_node.declare_parameter("cf", cf_default)
++            self.ros_node.declare_parameter("cf_delay", cf_delay_default)
++            self.ros_node.declare_parameter("cn", os.environ.get("cn", ""))
++            # lf=<t>: destroy the FRONT lidar actor at t (hardware-dead case)
++            self.ros_node.declare_parameter("lf", os.environ.get("lf", ""))
++            self.ros_node.declare_parameter("ln", os.environ.get("ln", ""))
++            self.ros_node.declare_parameter("lnf", os.environ.get("lnf", ""))
++            self.ros_node.declare_parameter("lnr", os.environ.get("lnr", ""))
++            self.ros_node.declare_parameter("imn", os.environ.get("imn", ""))
++            self.ros_node.declare_parameter("gn", os.environ.get("gn", ""))
++            # tail=<gap_m>: guarantee an NPC tailing the ego at <gap_m> meters
++            # (background traffic spawns mostly ahead — rear-end pressure for
++            # in-lane MRM stops needs an explicit chaser)
++            self.ros_node.declare_parameter("tail", os.environ.get("tail", ""))
++        self._fault_t0 = None
++        self._camera_killed = False
++        self._lidar_killed = False
++        self._tail_spawned = False
++        self._bridge_noise_started = set()
++        # npc=agg: make background traffic aggressive via the TrafficManager
++        self._npc_styled = False
++        self._imu_noise_sigma = 0.0
++        self._gnss_noise_sigma = 0.0
+ 
+         # V2X sens gt traffic light states
+         # Either the camera image or the v2x need to be set true
+         # For visualisation you can also set both to true 
+-        self._use_v2x_traffic_light = False 
+-        self._publish_cam_image = True 
++        self._use_v2x_traffic_light = False
++        self._publish_cam_image = True
+         self._traffic_light_ids = set()  
+ 
+         self._steps_before_init = 0
+@@ -201,13 +250,189 @@ class AutowareE2EAgent(TUMROSBaseAgent):
+ 
+         return sensors
+ 
+-    # After initial initialization the run step method should 
+-    # wait for the next control signal 
++    # lidar sector gates (deg): center azimuth / width in the sensor frame
++    _NOISE_SECTORS = {"R": (-90.0, 180.0), "L": (90.0, 180.0),
++                      "F": (0.0, 180.0), "B": (180.0, 180.0)}
++
++    @staticmethod
++    def _parse_fault(spec, default_mag):
++        # "20:0.1"   -> (20.0, 0.1, None)   whole sensor
++        # "20:0.1:R" -> (20.0, 0.1, "R")    right half only (lidar)
++        # "20"       -> (20.0, default_mag, None); "" -> None
++        if not spec:
++            return None
++        try:
++            parts = str(spec).split(":")
++            t = float(parts[0])
++            mag = float(parts[1]) if len(parts) > 1 and parts[1] else default_mag
++            sector = parts[2].upper() if len(parts) > 2 and parts[2] else None
++            return t, mag, sector
++        except ValueError:
++            print(f"[FAULT INJECTION] invalid fault spec {spec!r} — ignored")
++            return None
++
++    def _set_bridge_noise(self, node_names, sigma, sector=None):
++        # Noise is injected inside the cpp bridge nodes (this CARLA server build
++        # hangs on runtime sensor spawn, so the simulator is left untouched).
++        # Flip each bridge's noise_sigma parameter via its parameter service.
++        for name in node_names:
++            try:
++                cli = self.ros_node.create_client(SetParameters, f"/{name}/set_parameters")
++                req = SetParameters.Request()
++                params = []
++                if sector in self._NOISE_SECTORS and name.startswith("lidar"):
++                    c, w = self._NOISE_SECTORS[sector]
++                    params += [
++                        RclParameter(name="noise_yaw_center",
++                                     value=ParameterValue(type=ParameterType.PARAMETER_DOUBLE,
++                                                          double_value=c)),
++                        RclParameter(name="noise_yaw_width",
++                                     value=ParameterValue(type=ParameterType.PARAMETER_DOUBLE,
++                                                          double_value=w)),
++                    ]
++                params.append(RclParameter(
++                    name="noise_sigma",
++                    value=ParameterValue(type=ParameterType.PARAMETER_DOUBLE,
++                                         double_value=float(sigma))))
++                req.parameters = params
++                cli.call_async(req)
++                import time as _time
++                print(f"[FAULT INJECTION] noise_sigma={sigma}"
++                      f"{f' sector={sector}' if sector else ''} requested on /{name}"
++                      f" (wall {_time.strftime('%H:%M:%S')})")
++            except Exception as e:
++                print(f"[FAULT INJECTION] noise request on /{name} failed:", e)
++
++    # After initial initialization the run step method should
++    # wait for the next control signal
+ 
+     def run_step(self, input_data, timestamp):
+         timestamp = carla_timestamp = CarlaDataProvider.get_world().get_snapshot().timestamp.elapsed_seconds
+         print('COUNTER', self._counter)
+         self._counter += 1
++
++        # --- Fault injection (research) ---
++        # t counts from AUTONOMOUS engagement, not scenario start: boot eats
++        # 40-50 s, so counting from scenario start made "t=60" hit ~10 s into
++        # the actual drive and look like a pre-fault MRM.
++        if self._fault_t0 is None:
++            if self._is_autonomous:
++                self._fault_t0 = timestamp
++                print(f"[FAULT INJECTION] timer armed at sim {timestamp:.1f}s (engaged)")
++            fault_elapsed = -1.0
++        else:
++            fault_elapsed = timestamp - self._fault_t0
++
++        # npc=agg: aggressive background traffic (applied once, after spawns)
++        if not self._npc_styled and self._counter > 40 and os.environ.get("npc", "") == "agg":
++            self._npc_styled = True
++            try:
++                client = CarlaDataProvider.get_client()
++                tm = client.get_trafficmanager(CarlaDataProvider.get_traffic_manager_port())
++                styled = 0
++                for v in CarlaDataProvider.get_world().get_actors().filter("vehicle.*"):
++                    if v.attributes.get("role_name") in ("hero", "ego_vehicle"):
++                        continue
++                    tm.vehicle_percentage_speed_difference(v, -20.0)  # 20% above limit
++                    tm.distance_to_leading_vehicle(v, 0.5)            # tailgating
++                    tm.ignore_vehicles_percentage(v, 20.0)            # yields less
++                    tm.ignore_lights_percentage(v, 10.0)              # runs some lights
++                    styled += 1
++                print(f"[NPC] aggressive style applied to {styled} vehicles")
++            except Exception as e:
++                print("[NPC] aggressive style failed:", e)
++
++        # cf: destroy the camera entirely (image freezes downstream)
++        if not self._camera_killed and self.ros_node.get_parameter("cf").value:
++            fault_camera_delay = float(self.ros_node.get_parameter("cf_delay").value)
++            if fault_elapsed >= fault_camera_delay:
++                try:
++                    world = CarlaDataProvider.get_world()
++                    killed = 0
++                    for s in world.get_actors().filter('sensor.camera.rgb'):
++                        s.destroy(); killed += 1
++                    print(f"[FAULT INJECTION] destroyed {killed} camera sensor(s) at t+{fault_camera_delay:.0f}s")
++                except Exception as e:
++                    print("[FAULT INJECTION] camera destroy failed:", e)
++                self._camera_killed = True
++
++        # tail=<gap_m>: spawn a chasing NPC <gap_m> behind the ego once driving
++        if not self._tail_spawned and self._is_autonomous and self._counter > 40:
++            tail_env = self.ros_node.get_parameter("tail").value
++            if tail_env:
++                self._tail_spawned = True
++                try:
++                    gap = float(tail_env)
++                    world = CarlaDataProvider.get_world()
++                    ego = CarlaDataProvider.get_hero_actor()
++                    wp = CarlaDataProvider.get_map().get_waypoint(ego.get_location())
++                    prev = wp.previous(gap)
++                    if prev:
++                        tf = prev[0].transform
++                        tf.location.z += 0.5
++                        bp = world.get_blueprint_library().find("vehicle.audi.tt")
++                        bp.set_attribute("role_name", "tail_npc")
++                        npc = world.try_spawn_actor(bp, tf)
++                        if npc is not None:
++                            client = CarlaDataProvider.get_client()
++                            tm_port = CarlaDataProvider.get_traffic_manager_port()
++                            tm = client.get_trafficmanager(tm_port)
++                            npc.set_autopilot(True, tm_port)
++                            aggressive = os.environ.get("npc", "") == "agg"
++                            tm.distance_to_leading_vehicle(npc, 0.5 if aggressive else 2.0)
++                            tm.vehicle_percentage_speed_difference(
++                                npc, -30.0 if aggressive else -10.0)
++                            tm.ignore_lights_percentage(npc, 30.0 if aggressive else 0.0)
++                            print(f"[TAIL NPC] spawned {gap:.0f}m behind ego"
++                                  f" (aggressive={aggressive})")
++                        else:
++                            print("[TAIL NPC] spawn blocked (occupied), skipping")
++                    else:
++                        print("[TAIL NPC] no lane waypoint behind ego, skipping")
++                except Exception as e:
++                    print("[TAIL NPC] spawn failed:", e)
++
++        # lf=<t>: destroy the FRONT lidar actor — topic goes silent, the
++        # monitor's timeout checker (not the noise checker) must catch it
++        if not self._lidar_killed:
++            spec = self._parse_fault(self.ros_node.get_parameter("lf").value, 0.0)
++            if spec and fault_elapsed >= spec[0]:
++                try:
++                    world = CarlaDataProvider.get_world()
++                    killed = 0
++                    for s in world.get_actors().filter('sensor.lidar.ray_cast'):
++                        tag = (s.attributes.get("role_name", "")
++                               + s.attributes.get("ros_name", "")).lower()
++                        if "front" in tag:
++                            s.destroy(); killed += 1
++                    print(f"[FAULT INJECTION] destroyed {killed} front lidar(s) at t+{spec[0]:.0f}s")
++                except Exception as e:
++                    print("[FAULT INJECTION] lidar destroy failed:", e)
++                self._lidar_killed = True
++
++        # cn=<t>:<sigma>: gaussian pixel noise, injected in camera_bridge
++        # ln/lnf/lnr=<t>:<sigma>: radial distance noise in both/front/rear lidar_bridges
++        bridge_faults = [
++            ("cn", 15.0, ["camera_bridge_1"]),
++            ("ln", 0.1, ["lidar_bridge_1", "lidar_bridge_2"]),
++            ("lnf", 0.1, ["lidar_bridge_1"]),
++            ("lnr", 0.1, ["lidar_bridge_2"]),
++        ]
++        for flag, default_sigma, nodes in bridge_faults:
++            if flag in self._bridge_noise_started:
++                continue
++            spec = self._parse_fault(self.ros_node.get_parameter(flag).value, default_sigma)
++            if spec and fault_elapsed >= spec[0]:
++                self._set_bridge_noise(nodes, spec[1], spec[2])
++                self._bridge_noise_started.add(flag)
++
++        # imn=<t>:<sigma>: IMU noise (sigma rad/s on gyro, 10*sigma m/s^2 on accel)
++        # gn=<t>:<sigma>: position noise (meters) on the pose fed to the EKF
++        spec = self._parse_fault(self.ros_node.get_parameter("imn").value, 0.05)
++        self._imu_noise_sigma = spec[1] if spec and fault_elapsed >= spec[0] else 0.0
++        spec = self._parse_fault(self.ros_node.get_parameter("gn").value, 1.0)
++        self._gnss_noise_sigma = spec[1] if spec and fault_elapsed >= spec[0] else 0.0
++
+         # Autoware Timing
+         if self._aw_time is None:
+             self._steps_before_init += 1
+@@ -227,6 +452,9 @@ class AutowareE2EAgent(TUMROSBaseAgent):
+         ndt_pose_msg.header.frame_id = "map"
+         ndt_pose_msg.pose.pose.position = Point(**position["position"])
+         ndt_pose_msg.pose.pose.orientation = Quaternion(**position["orientation"])
++        if self._gnss_noise_sigma > 0.0:
++            ndt_pose_msg.pose.pose.position.x += float(np.random.normal(0.0, self._gnss_noise_sigma))
++            ndt_pose_msg.pose.pose.position.y += float(np.random.normal(0.0, self._gnss_noise_sigma))
+         self._gnss_pose_pub.publish(ndt_pose_msg)
+ 
+         # Steering Angle
+@@ -266,6 +494,14 @@ class AutowareE2EAgent(TUMROSBaseAgent):
+             z=velocity["orientation"]["yaw"]
+         )
+         imu_msg.linear_acceleration = Vector3(**loc_acc["position"])
++        if self._imu_noise_sigma > 0.0:
++            s = self._imu_noise_sigma
++            imu_msg.angular_velocity.x += float(np.random.normal(0.0, s))
++            imu_msg.angular_velocity.y += float(np.random.normal(0.0, s))
++            imu_msg.angular_velocity.z += float(np.random.normal(0.0, s))
++            imu_msg.linear_acceleration.x += float(np.random.normal(0.0, 10.0 * s))
++            imu_msg.linear_acceleration.y += float(np.random.normal(0.0, 10.0 * s))
++            imu_msg.linear_acceleration.z += float(np.random.normal(0.0, 10.0 * s))
+         self._imu_pub.publish(imu_msg)
+         
+         if self._use_v2x_traffic_light:
+@@ -303,9 +539,11 @@ class AutowareE2EAgent(TUMROSBaseAgent):
+         except queue.Empty:
+             control_timestamp, control = timestamp, self._last_control
+ 
+-        # We only wanted a longer wait time for the init phase
+-        # Now we will wait max 1 second for autoware calculations.
+-        self._time_to_wait_for_control = 1.0
++        # We only wanted a longer wait time for the init phase.
++        # 0.2 s (was 1.0): during reroute/replan the control stream gaps, and a
++        # 1 s blocking wait per tick collapses the sim to ~1 Hz, which the
++        # monitor then misreads as every sensor timing out (FTTI 850 ms).
++        self._time_to_wait_for_control = 0.2
+ 
+         return control
+ 
+@@ -314,7 +552,7 @@ class AutowareE2EAgent(TUMROSBaseAgent):
+         return AutowareE2EAgent.ROS_VERSION
+ 
+     def set_global_plan(self, global_plan_gps, global_plan_world_coord):
+-        ds_ids = downsample_route(global_plan_world_coord, 120)
++        ds_ids = downsample_route(global_plan_world_coord, 20)
+         
+         # Ensure the last waypoint is included
+         if ds_ids[-1] != len(global_plan_world_coord) - 1:
+@@ -343,7 +581,15 @@ class AutowareE2EAgent(TUMROSBaseAgent):
+ 
+         return (current_wp.transform, global_plan_world_coord[-1][1])
+ 
++    def _mrm_state_callback(self, msg):
++        was = self._mrm_active
++        self._mrm_active = msg.data.startswith("MRM")
++        if self._mrm_active and not was:
++            print(f"[MRM] supervisor took over the route ({msg.data}) — pausing goal updates")
++
+     def publish_global_plan(self, current_position):
++        if self._mrm_active:
++            return
+         if not self._global_plan_world_coord:
+             return
+ 
+@@ -359,6 +605,14 @@ class AutowareE2EAgent(TUMROSBaseAgent):
+                 return  
+ 
+         total_waypoints = len(self._global_plan_world_coord)
++
++        # dg=1: direct-goal mode — skip all intermediate waypoints and give
++        # Autoware only the final goal. No intermediate goals means nothing
++        # can get snapped onto a shoulder while driving fault-free.
++        if os.environ.get("dg", "") and self._route_index < total_waypoints - 1:
++            self._route_index = total_waypoints - 1
++            self._published_latest = False
++
+         is_last_waypoint = self._route_index >= total_waypoints - 1
+ 
+         # --- Advance route index based on distance ---
+@@ -401,23 +655,45 @@ class AutowareE2EAgent(TUMROSBaseAgent):
+             # Final goal MUST be published via topic so Autoware registers scenario completion
+             goal_pose_stamped = PoseStamped()
+             goal_pose_stamped.header.frame_id = "map"
+-            goal_pose_stamped.pose = Pose(
+-                position=Point(**next_pose_dict["position"]),
+-                orientation=Quaternion(**next_pose_dict["orientation"])
+-            )
+-            print("Publishing FINAL goal via topic")
++            dg_env = os.environ.get("dg", "")
++            if ":" in dg_env:
++                # dg=<x>:<y>[:<yaw_deg>] — custom final goal in ROS/map coords.
++                # mission_planner validates the goal ANGLE against the lane, so
++                # the yaw must roughly match the lane heading (identity = east);
++                # pass yaw_deg explicitly for lanes pointing elsewhere.
++                parts = dg_env.split(":")
++                gx, gy = float(parts[0]), float(parts[1])
++                yaw = math.radians(float(parts[2])) if len(parts) > 2 else 0.0
++                goal_pose_stamped.pose = Pose(
++                    position=Point(x=gx, y=gy, z=0.0),
++                    orientation=Quaternion(x=0.0, y=0.0,
++                                           z=math.sin(yaw / 2.0),
++                                           w=math.cos(yaw / 2.0))
++                )
++                print(f"Publishing CUSTOM final goal ({gx:.1f}, {gy:.1f}, "
++                      f"yaw {math.degrees(yaw):.0f}deg) via topic")
++            else:
++                goal_pose_stamped.pose = Pose(
++                    position=Point(**next_pose_dict["position"]),
++                    orientation=Quaternion(**next_pose_dict["orientation"])
++                )
++                print("Publishing FINAL goal via topic")
+             self._goal_publisher.publish(goal_pose_stamped)
+             self._published_latest = True
+         else:
+             # Intermediate goals via service
+-            # Guard against duplicate async calls
+             if self._pending_service_call:
+                 return
+ 
+             service_request = SetRoutePoints.Request()
+             service_request.header.frame_id = "map"
++            # Modification must stay on: raw CARLA waypoints can match the
++            # opposite lane / land behind the ego, making the planner loop
++            # around the block. Shoulder-snap confounds are prevented by
++            # goal_planner margin_from_boundary instead (narrow map shoulders
++            # can't host the car; MRM targets the widened off-route ones).
+             service_request.option.allow_goal_modification = True
+-            service_request.option.allow_while_using_route = True  # Fixed: must be True for mid-route updates
++            service_request.option.allow_while_using_route = True
+             service_request.goal = Pose(
+                 position=Point(**next_pose_dict["position"]),
+                 orientation=Quaternion(**next_pose_dict["orientation"])
+@@ -441,7 +717,7 @@ class AutowareE2EAgent(TUMROSBaseAgent):
+                 self._published_latest = True
+                 self._goal_mod_failure_counter = 0
+ 
+-            elif message == 'The route is not set yet.':
++            elif message == 'The route is not set yet.' and not self._mrm_active:
+                 # Route not initialized yet — publish initial goal via topic to bootstrap Autoware
+                 print("Route not set yet, publishing initial goal via topic")
+                 next_wp = self._global_plan_world_coord[self._route_index]

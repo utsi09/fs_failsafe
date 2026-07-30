@@ -1,0 +1,245 @@
+#include "cdr_monitor/update_system_state.hpp"
+#include <tf2/utils.h>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
+#include <iostream>
+using namespace std;
+
+UpdateSystemState::UpdateSystemState(const string& name, const NodeConfig& config,
+                                        const BT::RosNodeParams& params)
+    : SyncActionNode(name,config)
+{
+    node_= params.nh.lock();
+    path_pub_ = node_->create_publisher<visualization_msgs::msg::MarkerArray>(
+        "/kinematic_path", 10);
+    fov_pub_ = node_->create_publisher<visualization_msgs::msg::MarkerArray>(
+        "/sensor_fov", 10);
+
+    tf_buffer_ = std::make_shared<tf2_ros::Buffer>(node_->get_clock());
+    tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+
+    vector<string> fov_types = {"lidar", "camera", "radar"};
+    for (const auto& type : fov_types) {
+        vector<string> names;
+        node_->get_parameter("sensors." + type + ".names", names);
+
+        for (const auto& sensor_name : names) {
+            string prefix = "sensors." + type + "." + sensor_name + ".";
+            node_->declare_parameter<string>(prefix + "frame_id", "");
+            node_->declare_parameter<string>(prefix + "ns", "");
+            node_->declare_parameter<double>(prefix + "h_fov_deg", 0.0);
+            node_->declare_parameter<double>(prefix + "range", 0.0);
+            node_->declare_parameter<std::vector<double>>(prefix + "color", {0,0,0,0});
+
+            SensorFovSpec spec;
+            spec.name = sensor_name;
+            node_->get_parameter(prefix + "frame_id", spec.frame_id);
+            node_->get_parameter(prefix + "ns", spec.ns);
+            node_->get_parameter(prefix + "h_fov_deg", spec.h_fov_deg);
+            node_->get_parameter(prefix + "range", spec.range);
+
+            std::vector<double> color;
+            node_->get_parameter(prefix + "color", color);
+            spec.r = color[0]; spec.g = color[1];
+            spec.b = color[2]; spec.a = color[3];
+
+            sensors_.push_back(spec);
+        }
+    }
+}
+
+PortsList UpdateSystemState::providedPorts() {
+    return {
+        InputPort<double>("vel_x"),
+        InputPort<double>("vel_y"),
+        InputPort<double>("current_heading"),
+        OutputPort<string>("important_sensors"),
+    };
+}
+
+bool UpdateSystemState::isPathInFov(
+    const vector<geometry_msgs::msg::Point>& path_points,
+    const SensorFovSpec& spec)
+{
+    geometry_msgs::msg::TransformStamped tf;
+    try {
+        tf = tf_buffer_->lookupTransform(
+            "base_link", spec.frame_id, tf2::TimePointZero);
+    } catch (const tf2::TransformException&) {
+        return false;
+    }
+
+    double sx = tf.transform.translation.x;
+    double sy = tf.transform.translation.y;
+    double sensor_yaw = tf2::getYaw(tf.transform.rotation);
+
+    double half_fov = spec.h_fov_deg * M_PI / 180.0 / 2.0;
+
+    for (const auto& pt : path_points) {
+        double dx = pt.x - sx;
+        double dy = pt.y - sy;
+        double dist = sqrt(dx * dx + dy * dy);
+
+        if (dist > spec.range) continue;
+
+        double angle = atan2(dy, dx) - sensor_yaw;
+        while (angle > M_PI)  angle -= 2.0 * M_PI;
+        while (angle < -M_PI) angle += 2.0 * M_PI;
+
+        if (fabs(angle) <= half_fov) {
+            return true;
+        }
+    }
+    return false;
+}
+
+visualization_msgs::msg::Marker UpdateSystemState::createFovMarker(
+    const SensorFovSpec& spec, int id, const rclcpp::Time& stamp,
+    bool is_important, bool is_failed)
+{
+    visualization_msgs::msg::Marker marker;
+    marker.header.frame_id = spec.frame_id;
+    marker.header.stamp = stamp;
+    marker.ns = spec.ns;
+    marker.id = id;
+    marker.type = visualization_msgs::msg::Marker::LINE_STRIP;
+    marker.action = visualization_msgs::msg::Marker::ADD;
+
+    if (is_failed) {
+        marker.scale.x = 0.05;
+        marker.color.r = 1.0f;
+        marker.color.g = 0.0f;
+        marker.color.b = 0.0f;
+        marker.color.a = 1.0f;
+    } else if (is_important) {
+        marker.scale.x = 0.03;
+        marker.color.r = 1.0f;
+        marker.color.g = 0.5f;
+        marker.color.b = 0.0f;
+        marker.color.a = 0.9f;
+    } else {
+        marker.scale.x = 0.01;
+        marker.color.r = spec.r;
+        marker.color.g = spec.g;
+        marker.color.b = spec.b;
+        marker.color.a = spec.a;
+    }
+
+    double h_fov_rad = spec.h_fov_deg * M_PI / 180.0;
+    double start_angle = -h_fov_rad / 2.0;
+    double end_angle   =  h_fov_rad / 2.0;
+    int segments = 40;
+    double angle_step = (end_angle - start_angle) / segments;
+
+    geometry_msgs::msg::Point origin;
+    origin.x = 0.0; origin.y = 0.0; origin.z = 0.0;
+    marker.points.push_back(origin);
+
+    for (int i = 0; i <= segments; i++) {
+        double a = start_angle + i * angle_step;
+        geometry_msgs::msg::Point p;
+        p.x = spec.range * cos(a);
+        p.y = spec.range * sin(a);
+        p.z = 0.0;
+        marker.points.push_back(p);
+    }
+
+    marker.points.push_back(origin);
+
+    return marker;
+}
+
+NodeStatus UpdateSystemState::tick() {
+    double vel_x = 0.0, vel_y = 0.0;
+    double current_heading = 0.0;
+    getInput("vel_x", vel_x);
+    getInput("vel_y", vel_y);
+    getInput("current_heading", current_heading);
+
+    double current_vel = std::hypot(vel_x, vel_y);
+
+    rclcpp::Time now = node_->now();
+    double yaw_rate = 0.0;
+
+    if (first_tick_) {
+        first_tick_ = false;
+    } else {
+        double dt_real = (now - prev_time_).seconds();
+        if (dt_real > 0.001) {
+            double dh = current_heading - prev_heading_;
+            while (dh > M_PI)  dh -= 2.0 * M_PI;
+            while (dh < -M_PI) dh += 2.0 * M_PI;
+            yaw_rate = -dh / dt_real;
+        }
+    }
+    prev_heading_ = current_heading;
+    prev_time_ = now;
+
+    double x = 0.0, y = 0.0;
+    double heading = 0.0;
+    double dt = 0.1;
+    int steps = 15;
+
+    vector<geometry_msgs::msg::Point> path_points;
+    visualization_msgs::msg::MarkerArray path_array;
+    visualization_msgs::msg::Marker line_strip;
+    line_strip.header.frame_id = "base_link";
+    line_strip.header.stamp = now;
+    line_strip.ns = "prediction";
+    line_strip.id = 0;
+    line_strip.type = visualization_msgs::msg::Marker::LINE_STRIP;
+    line_strip.action = visualization_msgs::msg::Marker::ADD;
+
+    line_strip.scale.x = 0.15;
+    line_strip.color.r = 0.0; line_strip.color.g = 0.0; line_strip.color.b = 1.0;
+    line_strip.color.a = 0.8;
+
+    geometry_msgs::msg::Point start;
+    start.x = 0.0; start.y = 0.0; start.z = 0.1;
+    line_strip.points.push_back(start);
+    path_points.push_back(start);
+
+    for (int i = 0; i < steps; i++) {
+        heading += yaw_rate * dt;
+        x += current_vel * cos(heading) * dt;
+        y += current_vel * sin(heading) * dt;
+
+        geometry_msgs::msg::Point p;
+        p.x = x;
+        p.y = y;
+        p.z = 0.1;
+        line_strip.points.push_back(p);
+        path_points.push_back(p);
+    }
+
+    path_array.markers.push_back(line_strip);
+    path_pub_->publish(path_array);
+
+    visualization_msgs::msg::MarkerArray fov_array;
+    vector<string> important_list;
+
+    auto bb = config().blackboard;
+    for (size_t i = 0; i < sensors_.size(); i++) {
+        bool important = isPathInFov(path_points, sensors_[i]);
+        if (important) {
+            important_list.push_back(sensors_[i].name);
+        }
+        bool failed = false;
+        bb->get(sensors_[i].name + "_failed", failed);
+        fov_array.markers.push_back(
+            createFovMarker(sensors_[i], static_cast<int>(i), now, important, failed));
+    }
+    fov_pub_->publish(fov_array);
+
+    string important_str;
+    for (size_t i = 0; i < important_list.size(); i++) {
+        if (i > 0) important_str += ",";
+        important_str += important_list[i];
+    }
+
+    setOutput("important_sensors", important_str);
+    cout << "-------------------------------" << endl;
+    cout << "[CDR Monitor] Important Sensors: "
+         << (important_str.empty() ? "None" : important_str) << endl;
+
+    return NodeStatus::SUCCESS;
+}

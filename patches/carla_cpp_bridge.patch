@@ -1,0 +1,220 @@
+diff --git a/src/autoware_carla_cpp_bridge/include/autoware_carla_cpp_bridge/camera_bridge.hpp b/src/autoware_carla_cpp_bridge/include/autoware_carla_cpp_bridge/camera_bridge.hpp
+index 143d905..f13dcd6 100644
+--- a/src/autoware_carla_cpp_bridge/include/autoware_carla_cpp_bridge/camera_bridge.hpp
++++ b/src/autoware_carla_cpp_bridge/include/autoware_carla_cpp_bridge/camera_bridge.hpp
+@@ -1,6 +1,8 @@
+ #ifndef CAMERA_BRIDGE_HPP_
+ #define CAMERA_BRIDGE_HPP_
+ 
++#include <random>
++
+ #include <rclcpp/rclcpp.hpp>
+ #include <sensor_msgs/msg/image.hpp>
+ #include <sensor_msgs/msg/camera_info.hpp>
+@@ -35,6 +37,7 @@ private:
+   std::string frame_id_;
+   rclcpp::Time aw_time_;
+   sensor_msgs::msg::CameraInfo camera_info_;
++  std::mt19937 rng_{std::random_device{}()};
+ };
+ 
+ }  // namespace autoware_carla_cpp_bridge
+diff --git a/src/autoware_carla_cpp_bridge/include/autoware_carla_cpp_bridge/lidar_bridge.hpp b/src/autoware_carla_cpp_bridge/include/autoware_carla_cpp_bridge/lidar_bridge.hpp
+index 1fc53ee..b7cfd04 100644
+--- a/src/autoware_carla_cpp_bridge/include/autoware_carla_cpp_bridge/lidar_bridge.hpp
++++ b/src/autoware_carla_cpp_bridge/include/autoware_carla_cpp_bridge/lidar_bridge.hpp
+@@ -1,6 +1,8 @@
+ #ifndef LIDAR_BRIDGE_HPP_
+ #define LIDAR_BRIDGE_HPP_
+ 
++#include <random>
++
+ #include <rclcpp/rclcpp.hpp>
+ #include <sensor_msgs/msg/point_cloud2.hpp>
+ #include <std_msgs/msg/bool.hpp>
+@@ -43,6 +45,7 @@ private:
+   bool sync_state_ = true;
+   sensor_msgs::msg::PointCloud2 last_lidar_msg_;
+   bool last_lidar_msg_received = false;
++  std::mt19937 rng_{std::random_device{}()};
+ 
+ };
+ 
+diff --git a/src/autoware_carla_cpp_bridge/launch/aw_carla_cpp_bridge.launch.py b/src/autoware_carla_cpp_bridge/launch/aw_carla_cpp_bridge.launch.py
+index 46a7d65..1ba829f 100644
+--- a/src/autoware_carla_cpp_bridge/launch/aw_carla_cpp_bridge.launch.py
++++ b/src/autoware_carla_cpp_bridge/launch/aw_carla_cpp_bridge.launch.py
+@@ -1,6 +1,8 @@
+ from launch import LaunchDescription
+ from launch_ros.actions import Node
+ 
++SIM_TIME = {'use_sim_time': True}
++
+ def generate_launch_description():
+     return LaunchDescription([
+         # Launch the central aw_carla_bridge_node
+@@ -9,10 +11,13 @@ def generate_launch_description():
+             executable='aw_carla_bridge_node',
+             name='aw_carla_bridge',
+             parameters=[{
+-                'nodes_to_wait_for': ['AutowareE2EAgent', 'lidar_bridge_1', 
++                'nodes_to_wait_for': ['autoware_e2e_node', 'lidar_bridge_1',
+                                       'lidar_bridge_2', 'camera_bridge_1']
+-            }],
+-            arguments=['--ros-args', '--log-level', 'debug']
++            }, SIM_TIME],
++            remappings=[
++                ('/control/trajectory_follower/control_cmd', '/control/command/control_cmd'),
++            ],
++            arguments=['--ros-args', '--log-level', 'info']
+         ),
+ 
+         # Launch lidar_bridge_node instances
+@@ -20,17 +25,19 @@ def generate_launch_description():
+             package='autoware_carla_cpp_bridge',
+             executable='lidar_bridge_node',
+             name='lidar_bridge_1',
++            parameters=[SIM_TIME],
+             arguments=[
+                 '/carla/ego_vehicle/sensor/lidar/front/point_cloud',
+                 '/sensor/lidar/front',
+                 'lidar_front',
+-                '128' 
++                '128'
+             ]
+         ),
+         Node(
+             package='autoware_carla_cpp_bridge',
+             executable='lidar_bridge_node',
+             name='lidar_bridge_2',
++            parameters=[SIM_TIME],
+             arguments=[
+                 '/carla/ego_vehicle/sensor/lidar/back/point_cloud',
+                 '/sensor/lidar/rear',
+@@ -39,15 +46,16 @@ def generate_launch_description():
+             ]
+         ),
+         # Launch camera_bridge_node instances
+-                Node(
++        Node(
+             package='autoware_carla_cpp_bridge',
+             executable='camera_bridge_node',
+             name='camera_bridge_1',
++            parameters=[SIM_TIME],
+             arguments=[
+                 '/carla/ego_vehicle/sensor/camera/image',
+                 '/sensing/camera/traffic_light/image_raw',
+                 'camera_front_optical_link',
+-                '90','400','800'
++                '90', '400', '800'
+             ]
+         )
+     ])
+\ No newline at end of file
+diff --git a/src/autoware_carla_cpp_bridge/src/camera_bridge.cpp b/src/autoware_carla_cpp_bridge/src/camera_bridge.cpp
+index 7c208d8..1f76254 100644
+--- a/src/autoware_carla_cpp_bridge/src/camera_bridge.cpp
++++ b/src/autoware_carla_cpp_bridge/src/camera_bridge.cpp
+@@ -1,4 +1,5 @@
+ #include "autoware_carla_cpp_bridge/camera_bridge.hpp"
++#include <algorithm>
+ #include <memory>
+ #include <cmath>
+ 
+@@ -19,6 +20,10 @@ namespace autoware_carla_cpp_bridge
+ {
+   RCLCPP_INFO(this->get_logger(), "CameraBridge Node '%s' started.", node_name.c_str());
+ 
++  // Fault injection: gaussian pixel noise (0-255 scale), 0.0 = off.
++  // Set at runtime: ros2 param set /<node> noise_sigma 15.0
++  this->declare_parameter<double>("noise_sigma", 0.0);
++
+   // Initialize Camera Info
+   camera_info_.header.frame_id = frame_id_;
+   camera_info_.height = height;
+@@ -78,6 +83,21 @@ void CameraBridge::imageCallback(const sensor_msgs::msg::Image::SharedPtr msg)
+   auto modified_msg = *msg;
+   modified_msg.header.frame_id = frame_id_;
+   modified_msg.header.stamp = aw_time_;
++
++  const double sigma = this->get_parameter("noise_sigma").as_double();
++  if (sigma > 0.0 && modified_msg.width > 0) {
++    std::normal_distribution<float> dist(0.0f, static_cast<float>(sigma));
++    const size_t pixel_stride = modified_msg.step / modified_msg.width;  // 4 for bgra8
++    const size_t color_bytes = std::min<size_t>(pixel_stride, 3);        // skip alpha
++    auto & data = modified_msg.data;
++    for (size_t i = 0; i + pixel_stride <= data.size(); i += pixel_stride) {
++      for (size_t c = 0; c < color_bytes; ++c) {
++        const float v = static_cast<float>(data[i + c]) + dist(rng_);
++        data[i + c] = static_cast<uint8_t>(std::clamp(v, 0.0f, 255.0f));
++      }
++    }
++  }
++
+   image_pub_->publish(modified_msg);
+ 
+   camera_info_.header.stamp = aw_time_;
+diff --git a/src/autoware_carla_cpp_bridge/src/lidar_bridge.cpp b/src/autoware_carla_cpp_bridge/src/lidar_bridge.cpp
+index 9f12092..04e34c2 100644
+--- a/src/autoware_carla_cpp_bridge/src/lidar_bridge.cpp
++++ b/src/autoware_carla_cpp_bridge/src/lidar_bridge.cpp
+@@ -1,4 +1,5 @@
+ #include "autoware_carla_cpp_bridge/lidar_bridge.hpp"
++#include <cmath>
+ #include <memory>
+ 
+ namespace autoware_carla_cpp_bridge
+@@ -17,6 +18,14 @@ LidarBridge::LidarBridge(
+ {
+   RCLCPP_INFO(this->get_logger(), "LidarBridge Node '%s' started.", node_name.c_str());
+ 
++  // Fault injection: gaussian noise along each ray (meters), 0.0 = off.
++  // Set at runtime: ros2 param set /<node> noise_sigma 0.1
++  // Optional sector gate: noise only within +-width/2 around the center
++  // azimuth (deg, sensor frame, x forward / y left). width 360 = everywhere.
++  this->declare_parameter<double>("noise_sigma", 0.0);
++  this->declare_parameter<double>("noise_yaw_center", 0.0);
++  this->declare_parameter<double>("noise_yaw_width", 360.0);
++
+   // Publisher
+   rclcpp::QoS qos(rclcpp::KeepLast(5));
+   qos.best_effort();
+@@ -123,6 +132,11 @@ void LidarBridge::lidarCallback(const sensor_msgs::msg::PointCloud2::SharedPtr m
+ 
+   PointXYZIRC* points = reinterpret_cast<PointXYZIRC*>(modified_msg.data.data());
+ 
++  const float sigma = static_cast<float>(this->get_parameter("noise_sigma").as_double());
++  const float yaw_c = static_cast<float>(this->get_parameter("noise_yaw_center").as_double());
++  const float yaw_w = static_cast<float>(this->get_parameter("noise_yaw_width").as_double());
++  std::normal_distribution<float> noise_dist(0.0f, sigma > 0.0f ? sigma : 1.0f);
++
+   for (size_t i = 0; i < valid_point_count; ++i) {
+       const uint8_t* src = &msg->data[i * msg->point_step];
+ 
+@@ -131,6 +145,26 @@ void LidarBridge::lidarCallback(const sensor_msgs::msg::PointCloud2::SharedPtr m
+       float z = *reinterpret_cast<const float*>(src + 8);
+       float intensity_f = *reinterpret_cast<const float*>(src + 12);
+ 
++      if (sigma > 0.0f) {
++        bool in_sector = yaw_w >= 360.0f;
++        if (!in_sector) {
++          float az = std::atan2(y, x) * 57.29578f;
++          float d = std::fabs(az - yaw_c);
++          if (d > 180.0f) d = 360.0f - d;
++          in_sector = d <= yaw_w * 0.5f;
++        }
++        if (in_sector) {
++          // radial distance noise, equivalent to CARLA's lidar noise_stddev
++          const float r = std::sqrt(x * x + y * y + z * z);
++          if (r > 0.01f) {
++            const float scale = 1.0f + noise_dist(rng_) / r;
++            x *= scale;
++            y *= scale;
++            z *= scale;
++          }
++        }
++      }
++
+       uint8_t intensity = static_cast<uint8_t>(std::clamp(intensity_f * 255.0f, 0.0f, 255.0f));
+ 
+       points[i].x = x;

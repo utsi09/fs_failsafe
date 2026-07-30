@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>mrm_supervisor</name>
+  <version>0.1.0</version>
+  <description>Score-based MRM supervisor: picks a safe stop location (road shoulder /
+    parking lot) from the lanelet2 map using sensor capability scores and reroutes
+    Autoware via the AD API (MRM_MOVE state between stock comfortable/emergency stop).</description>
+  <maintainer email="utsi09@g.skku.edu">taewook</maintainer>
+  <license>MIT</license>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>diagnostic_msgs</exec_depend>
+  <exec_depend>visualization_msgs</exec_depend>
+  <exec_depend>autoware_adapi_v1_msgs</exec_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

@@ -1,0 +1,51 @@
+# Sensor config for the autoware_carla_leaderboard (awcl) setup.
+# Topics are the cpp-bridge outputs that Autoware consumes, so the monitor sees
+# exactly what Autoware sees (including bridge-injected noise_sigma faults).
+# yaw_deg/h_fov_deg define the nominal coverage used for the 8-sector map:
+# the two CARLA lidars are physically 360 deg, but front/rear responsibility
+# is split so that per-sensor faults show up as directional coverage loss.
+/**:
+  ros__parameters:
+    use_sim_time: true
+    sensors:
+      lidar:
+        names: ["LIDAR_front", "LIDAR_rear"]
+        LIDAR_front:
+          frame_id: "base_link"
+          ns: "lidar"
+          topic: "/sensor/lidar/front"
+          h_fov_deg: 220.0
+          yaw_deg: 0.0
+          range: 85.0
+          color: [0.0, 1.0, 0.0, 0.7]
+        LIDAR_rear:
+          frame_id: "base_link"
+          ns: "lidar"
+          topic: "/sensor/lidar/rear"
+          h_fov_deg: 220.0
+          yaw_deg: 180.0
+          range: 85.0
+          color: [0.0, 0.7, 1.0, 0.7]
+
+      camera:
+        names: ["CAMERA_front"]
+        CAMERA_front:
+          frame_id: "base_link"
+          ns: "camera"
+          topic: "/sensing/camera/traffic_light/image_raw"
+          msg_type: "sensor_msgs/msg/Image"
+          h_fov_deg: 90.0
+          yaw_deg: 0.0
+          range: 60.0
+          color: [0.0, 0.9, 0.6, 0.7]
+
+      # radar: intentionally absent (declares default to an empty list;
+      # an explicit empty [] cannot be typed by the ROS2 param parser)
+
+      imu:
+        topic: "/sensing/imu/imu_data"
+        frame_id: "imu_link"
+
+      gps:
+        topic: ""
+        frame_id: "gps"
