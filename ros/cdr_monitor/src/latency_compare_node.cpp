@@ -1,10 +1,10 @@
 /**
- * 같은 메시지를 typed sub / CDR sub 동시에 받아서
- * wall-clock 도착 시간 차이를 기록.
- *
- * single-threaded executor → CDR sub(먼저 생성) 콜백이 먼저 실행,
- * typed sub 콜백은 executor가 역직렬화 후 실행.
- * diff = wall_typed - wall_cdr ≈ 역직렬화 소요 시간.
+ * [latency_compare_node.cpp] (보조 도구) 역직렬화 지연 측정기.
+ *   같은 메시지 하나를 두 방식(typed 구독 / CDR generic 구독)으로 동시에 받아,
+ *   각 콜백이 실행된 벽시계 시각의 차이를 CSV로 기록한다.
+ *   단일 스레드 executor에서는 먼저 만든 CDR 구독의 콜백이 먼저 돌고,
+ *   typed 구독 콜백은 executor가 역직렬화를 마친 뒤에 돈다. 따라서
+ *   diff = wall_typed - wall_cdr ≈ 역직렬화에 걸린 시간 (논문 근거 자료용).
  */
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
@@ -32,6 +32,8 @@ public:
 
         auto qos = rclcpp::SensorDataQoS();
 
+        // ── CDR(generic) 구독 4개: 원시 바이트에서 타임스탬프만 파싱해 수신 시각 기록 ──
+        // (typed 구독보다 "먼저" 생성해야 single-threaded executor에서 콜백이 먼저 돈다)
         g_lidar_ = create_generic_subscription(
             "/lidar_points", "sensor_msgs/msg/PointCloud2", qos,
             [this](std::shared_ptr<rclcpp::SerializedMessage> msg) {
@@ -57,6 +59,7 @@ public:
         rclcpp::QoS qos_be(10);
         qos_be.best_effort();
 
+        // ── typed 구독 4개: 같은 토픽을 일반 방식으로도 받아 수신 시각을 비교 ──
         t_lidar_ = create_subscription<sensor_msgs::msg::PointCloud2>(
             "/lidar_points", qos_be,
             [this](const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
@@ -95,11 +98,13 @@ private:
         return static_cast<int64_t>(t.sec) * 1000000000LL + t.nanosec;
     }
 
+    // CDR 쪽 콜백: 이 메시지의 (스탬프, 도착 시각)을 기억해 둔다
     void cdr_cb(int idx, int64_t stamp_ns) {
         last_cdr_wall_[idx] = SC::now().time_since_epoch().count();
         last_cdr_stamp_[idx] = stamp_ns;
     }
 
+    // typed 쪽 콜백: 스탬프가 같으면 "같은 메시지"이므로 도착 시각 차이 = 역직렬화 시간
     void typed_cb(int idx, int64_t stamp_ns) {
         int64_t wall_typed = SC::now().time_since_epoch().count();
 

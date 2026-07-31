@@ -1,13 +1,10 @@
 /**
- * Sensor timeout recorder — fair A/B comparison for paper.
- *
- * Mode "typed":  create_subscription<T>       (normal ROS2 approach)
- * Mode "cdr":    create_generic_subscription   + CDR stamp parse
- *
- * Both use wall-clock (steady_clock) for timing → captures real
- * deserialization overhead that sim_time hides.
- *
- * Output CSV: same format as sensor_log.csv
+ * [recorder_node.cpp] (보조 도구) 논문용 A/B 비교 실험 기록기.
+ *   센서 수신 타임아웃/FTTI/고장 판정을 50ms마다 CSV 한 줄로 기록한다.
+ *   mode="typed": 일반 구독(create_subscription, 메시지를 완전히 해석해서 받음)
+ *   mode="cdr"  : generic 구독(원시 바이트로 받아 타임스탬프만 부분 파싱) — 더 가벼움
+ *   두 방식 모두 벽시계(steady_clock)로 재서, 시뮬레이션 시간이 숨기는
+ *   실제 역직렬화 비용까지 측정한다. 출력 CSV는 sensor_log.csv와 같은 형식.
  */
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
@@ -47,7 +44,9 @@ public:
         rclcpp::QoS qos_be(10);
         qos_be.best_effort();
 
-        // velocity & obstacle — always typed (small msgs, need data)
+        // 속도/장애물은 메시지가 작고 내용이 필요해서 항상 typed 구독.
+        // [this](...){...} 는 람다 = "이 객체(this)를 기억하는 즉석 함수".
+        // 메시지가 도착할 때마다 이 함수(콜백)가 호출된다.
         sub_vel_ = create_subscription<geometry_msgs::msg::TwistStamped>(
             "/vel", 10,
             [this](const geometry_msgs::msg::TwistStamped::SharedPtr msg) {
@@ -56,7 +55,8 @@ public:
                 speed_ms_.store(std::sqrt(vx*vx + vy*vy) * 1e6);
             });
 
-        // ── sensor subscriptions ──
+        // ── 센서 구독 (모드에 따라 typed / cdr 중 한 방식으로) ──
+        // 콜백은 수신 순간의 벽시계 시각만 wall_recv_[i]에 저장한다 (원자 변수라 스레드 안전)
         if (mode_ == "typed") {
             sub_lidar_t_ = create_subscription<sensor_msgs::msg::PointCloud2>(
                 "/lidar_points", qos_be,
@@ -79,9 +79,10 @@ public:
                     wall_recv_[3].store(SC::now().time_since_epoch().count());
                 });
         } else {
+            // cdr 모드: "콜백을 만들어 주는 람다" — idx만 바꿔 4개 센서에 재사용
             auto make_cb = [this](int idx) {
                 return [this, idx](std::shared_ptr<rclcpp::SerializedMessage> msg) {
-                    (void)cdr_parser::parse_stamp_ns(msg);   // CDR parse
+                    (void)cdr_parser::parse_stamp_ns(msg);   // 원시 바이트에서 타임스탬프만 CDR 파싱
                     wall_recv_[idx].store(SC::now().time_since_epoch().count());
                 };
             };
@@ -125,6 +126,8 @@ public:
     }
 
 private:
+    // 50ms마다 타이머가 호출: 각 센서의 "마지막 수신 후 경과 시간"과
+    // FTTI(= min(TTC, 850ms)) 를 비교해 고장 여부를 판정하고 CSV 한 줄 기록
     void tick()
     {
         int64_t now_ns = SC::now().time_since_epoch().count();
@@ -155,9 +158,9 @@ private:
             double ftti = std::min(ttc, ftti_default);
 
             int fault = 0;
-            if (i < 2) {  // lidar, camera
+            if (i < 2) {  // 라이다/카메라: FTTI(동적 데드라인) 초과면 즉시 고장
                 fault = (timeout_ms < 0 || timeout_ms > ftti) ? 1 : 0;
-            } else {       // imu, gps
+            } else {       // IMU/GPS: 주기의 3배 초과가 3번 연속이면 고장 (디바운스)
                 if (timeout_ms < 0 || timeout_ms > periods[i] * 3)
                     fail_count_[i]++;
                 else

@@ -1,3 +1,10 @@
+/**
+ * [benchmark_node.cpp] (보조 도구) 메시지 수신 3가지 방식의 비용 벤치마크.
+ *   같은 토픽을 세 방법(A/B/C)으로 동시에 구독해서, 콜백 안에서 걸린 시간을
+ *   CSV(/tmp/cdr_benchmark.csv)로 기록한다. 논문의 "CDR 부분 파싱이 얼마나
+ *   싼가" 근거 자료용. A=일반 typed 구독, B=generic 구독 + 전체 역직렬화,
+ *   C=generic 구독 + 타임스탬프만 CDR 부분 파싱(우리 방식).
+ */
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp/serialization.hpp>
 #include <sensor_msgs/msg/compressed_image.hpp>
@@ -30,9 +37,9 @@ public:
         csv_.open(csv_path_);
         csv_ << "seq,method,callback_us,stamp_ns,recv_ns,msg_bytes\n";
 
-        // ── Method A: normal typed subscription ──
-        // Note: deserialization happens in the executor BEFORE callback.
-        // callback_us here is only the stamp-read time (artificially low).
+        // ── 방법 A: 일반 typed 구독 ──
+        // 주의: 역직렬화는 콜백이 불리기 "전에" executor가 이미 해 버린다.
+        // 그래서 여기서 잰 callback_us는 스탬프 읽기 시간뿐 (실제보다 작게 나옴).
         if (msg_type_ == "sensor_msgs/msg/CompressedImage") {
             sub_a_img_ = create_subscription<sensor_msgs::msg::CompressedImage>(
                 topic_, rclcpp::SensorDataQoS(),
@@ -57,7 +64,8 @@ public:
                 });
         }
 
-        // ── Method B: generic sub → full deserialization in callback ──
+        // ── 방법 B: generic 구독 → 콜백 안에서 메시지 전체를 역직렬화 ──
+        // 원시 바이트로 받아서 직접 풀기 때문에 역직렬화 비용이 콜백 시간에 그대로 잡힌다
         sub_b_ = create_generic_subscription(
             topic_, msg_type_, rclcpp::SensorDataQoS(),
             [this](std::shared_ptr<rclcpp::SerializedMessage> msg) {
@@ -83,7 +91,8 @@ public:
                 record("B", seq_b_++, t0, t1, stamp_ns, sz);
             });
 
-        // ── Method C: generic sub → CDR partial parse (stamp only) ──
+        // ── 방법 C: generic 구독 → CDR 부분 파싱 (타임스탬프만) — 우리 방식 ──
+        // 전체를 풀지 않고 헤더의 스탬프 바이트만 읽는다 → B보다 훨씬 싸다는 걸 보이는 게 목적
         sub_c_ = create_generic_subscription(
             topic_, msg_type_, rclcpp::SensorDataQoS(),
             [this](std::shared_ptr<rclcpp::SerializedMessage> msg) {
@@ -108,13 +117,16 @@ public:
     }
 
 private:
+    // 측정 결과 한 건을 CSV에 기록. 세 콜백이 공용으로 부른다.
     void record(const char* method, int seq,
                 hrc::time_point t0, hrc::time_point t1,
                 int64_t stamp_ns, size_t bytes)
     {
-        double us = std::chrono::duration<double, std::micro>(t1 - t0).count();
+        double us = std::chrono::duration<double, std::micro>(t1 - t0).count();   // 콜백 소요 시간 [us]
         int64_t recv_ns = now().nanoseconds();
 
+        // mutex = 한 번에 한 스레드만 통과시키는 자물쇠. 여러 콜백이 동시에
+        // CSV에 쓰다가 줄이 섞이는 걸 막는다. lock_guard는 이 블록을 나갈 때 자동으로 풀어줌.
         std::lock_guard<std::mutex> lk(mu_);
         csv_ << seq << "," << method << "," << us << ","
              << stamp_ns << "," << recv_ns << "," << bytes << "\n";
