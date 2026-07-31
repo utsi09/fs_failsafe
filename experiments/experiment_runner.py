@@ -56,7 +56,10 @@ AUTOWARE_READY_TIMEOUT = 120.0
 CASE_TIMEOUT_S = 420.0          # hard cap per case
 STOPPED_SPEED = 0.15            # m/s
 DEFER_STOP_CONFIRM_S = 30.0     # DEFER + stopped this long -> case over
-STUCK_CONFIRM_S = 60.0          # stopped this long without MRM state -> stuck
+# Town07 lights: ~10 s green per ~45 s rotation. Missing ONE green is
+# tolerated; standing through TWO full cycles in NORMAL state means the
+# stock stack lost the light (recognition miss) -> fail fast, next case
+JUNCTION_STUCK_S = 100.0
 # Town07 junctions cycle ~10 s green in a ~45 s rotation, so a legitimate
 # red-light wait en route to the shoulder can exceed 60 s — give MRM_MOVE
 # three full cycles before calling it stuck
@@ -340,6 +343,9 @@ class Judge:
         self.deg_dist = 0.0            # meters driven after the fault
         self.min_gap = None            # nearest obstacle while stationary post-fault
         self._last_xy = None
+        self._obs_start = None         # traffic-flow observation window
+        self._obs_samples = []
+        self.traffic = ""              # cleared / blocked after the stop
 
         self.node.create_subscription(
             String, "/mrm_supervisor/state", self._state_cb,
@@ -376,6 +382,8 @@ class Judge:
                 and self.speed < 0.5 and msg.data < 900.0):
             if self.min_gap is None or msg.data < self.min_gap:
                 self.min_gap = msg.data
+        if self._obs_start is not None and msg.data < 900.0:
+            self._obs_samples.append(msg.data)
 
     OP_MODE_NAMES = {0: "UNKNOWN", 1: "STOP", 2: "AUTONOMOUS", 3: "LOCAL", 4: "REMOTE"}
 
@@ -389,7 +397,7 @@ class Judge:
     def _spin_loop(self):
         # keep spinning through transient errors — a dead spin thread leaves
         # the judge blind (empty state, nan pose) for every remaining case
-        while self.rclpy.ok():
+        while getattr(self, "_spin_alive", True) and self.rclpy.ok():
             try:
                 self.rclpy.spin_once(self.node, timeout_sec=0.2)
             except Exception:
@@ -451,8 +459,10 @@ class Judge:
             stationary_for = (now - self.stationary_since) if self.stationary_since else 0.0
 
             # supervisor publishes "STATE:target", e.g. "MRM_PARKED:shoulder_X"
+            verdict = None
             if self.state.startswith("MRM_PARKED"):
-                return "SHOULDER_SUCCESS" if "shoulder" in self._target() else "PARKED_SUCCESS", self._detail()
+                verdict = ("SHOULDER_SUCCESS" if "shoulder" in self._target()
+                           else "PARKED_SUCCESS")
             # stock Autoware MRM finished (comfortable/emergency stop done):
             # more informative than the generic "DEFER + stopped" fallback.
             # Only counts after the ego actually drove — during startup the
@@ -460,12 +470,33 @@ class Judge:
             # reaches MRM_SUCCEEDED immediately.
             # stopped_for guard: with a flapping hazard, MRM_SUCCEEDED shows up
             # transiently mid-drive — require an actual sustained stop
-            if (self.aw_state == self.MrmState.MRM_SUCCEEDED and self.moved
+            if (verdict is None
+                    and self.aw_state == self.MrmState.MRM_SUCCEEDED and self.moved
                     and stopped_for > 5.0):
                 behavior = self.aw_behaviors[-1] if self.aw_behaviors else "UNKNOWN"
-                return f"AW_{behavior}_DONE", self._detail()
-            if self.state.startswith("MRM_DEFER") and stationary_for > DEFER_STOP_CONFIRM_S:
-                return "DEFER_STOPPED", self._detail()
+                verdict = f"AW_{behavior}_DONE"
+            if (verdict is None and self.state.startswith("MRM_DEFER")
+                    and stationary_for > DEFER_STOP_CONFIRM_S):
+                verdict = "DEFER_STOPPED"
+            if verdict is not None:
+                # don't close the case yet: watch ~10 s whether rear traffic
+                # actually gets PAST the stopped ego (shoulder park should
+                # read "cleared", an in-lane stop with a chaser "blocked")
+                if self._obs_start is None:
+                    self._obs_start = now
+                    self._obs_samples = []
+                    print(f"[judge] {verdict} — observing traffic flow 10 s")
+                lb_dead = lb_proc is not None and lb_proc.poll() is not None
+                if now - self._obs_start >= 10.0 or lb_dead:
+                    smp = self._obs_samples
+                    if smp:
+                        gmin = min(smp)
+                        gend = sum(smp[-3:]) / len(smp[-3:])
+                        self.traffic = ("blocked" if gend < 12.0 and gend - gmin < 3.0
+                                        else "cleared")
+                    return verdict, self._detail()
+                time.sleep(1.0)
+                continue
             if lb_proc is not None and lb_proc.poll() is not None:
                 # judge can miss latched states (observed once after a DDS
                 # vendor mix-up) — recover the verdict from the supervisor log
@@ -480,8 +511,9 @@ class Judge:
                     except OSError:
                         pass
                 return "SCENARIO_ENDED", self._detail()
-            if self.moved and self.state == "" and stopped_for > STUCK_CONFIRM_S:
-                return "STUCK_NO_MRM", self._detail()
+            if (self.moved and self.state in ("", "NORMAL")
+                    and stationary_for > JUNCTION_STUCK_S):
+                return "STUCK_AT_JUNCTION", self._detail()
             if self.state.startswith("MRM_MOVE") and stopped_for > MRM_MOVE_STUCK_S:
                 return "STUCK_IN_MRM_MOVE", self._detail()
             if elapsed > CASE_TIMEOUT_S:
@@ -512,6 +544,7 @@ class Judge:
                 "det_latency_s": det, "tts_fault_s": tts_fault,
                 "deg_dist_m": round(self.deg_dist, 1) if self.fault_time else "",
                 "min_gap_m": round(self.min_gap, 1) if self.min_gap is not None else "",
+                "traffic": self.traffic,
                 "aw_mrm": "+".join(self.aw_behaviors)}
 
     def reset(self):
@@ -529,8 +562,16 @@ class Judge:
         self.deg_dist = 0.0
         self.min_gap = None
         self._last_xy = None
+        self._obs_start = None
+        self._obs_samples = []
+        self.traffic = ""
 
     def shutdown(self):
+        self._spin_alive = False
+        try:
+            self._spin.join(timeout=2.0)
+        except Exception:
+            pass
         try:
             self.rclpy.shutdown()
         except Exception:
@@ -552,19 +593,34 @@ def lane_occupancy(x, y):
             sys.path.insert(0, "/home/taewook/fs_ws/src/mrm_supervisor")
             from mrm_supervisor.map_model import MapModel
             _MAP = MapModel("/home/taewook/awcl_maps/Town07/lanelet2_map.osm")
-        lid = _MAP.nearest_road_lanelet(x, y)
-        ll = _MAP.lanelets[lid]
-        c = ll["center"]
-        # lateral offset from the centerline (nearest vertex is enough at
-        # the ~1 m fidelity we need)
-        lat = min(math.dist((x, y), p) for p in c)
+        def seg_dist(pt, pts):
+            # point-to-POLYLINE distance: straight lanelets have vertices
+            # 30 m apart, so nearest-vertex distance wildly overestimates
+            best = float("inf")
+            for i in range(len(pts) - 1):
+                (x1, y1), (x2, y2) = pts[i], pts[i + 1]
+                dx, dy = x2 - x1, y2 - y1
+                L2 = dx * dx + dy * dy
+                t = 0.0 if L2 == 0 else max(0.0, min(1.0,
+                    ((pt[0] - x1) * dx + (pt[1] - y1) * dy) / L2))
+                best = min(best, math.dist(pt, (x1 + t * dx, y1 + t * dy)))
+            return best
+
+        # nearest road lanelet by SEGMENT distance too
+        best_lid, best_d = None, float("inf")
+        for cand_lid, cand in _MAP.lanelets.items():
+            if cand["subtype"] != "road":
+                continue
+            d = seg_dist((x, y), cand["center"])
+            if d < best_d:
+                best_lid, best_d = cand_lid, d
+        ll = _MAP.lanelets[best_lid]
+        lat = best_d
         lpts = _MAP._ways.get(ll["left"], [])
         rpts = _MAP._ways.get(ll["right"], [])
-        if not lpts or not rpts:
+        if len(lpts) < 2 or len(rpts) < 2:
             return "", ""
-        lp = min(lpts, key=lambda p: math.dist((x, y), p))
-        rp = min(rpts, key=lambda p: math.dist((x, y), p))
-        width = math.dist(lp, rp)
+        width = seg_dist((x, y), lpts) + seg_dist((x, y), rpts)
         half_car = 0.95
         overlap = max(0.0, min(lat + half_car, width / 2) - max(lat - half_car, -width / 2))
         return round(overlap, 2), round(100.0 * overlap / width, 1)
@@ -609,7 +665,7 @@ def run(args):
         wr.writerow(["idx", "method", "fault", "severity", "trigger_s", "npc", "rep",
                      "outcome", "final_state", "aw_mrm", "stop_x", "stop_y",
                      "lane_overlap_m", "lane_block_pct",
-                     "det_latency_s", "tts_fault_s", "deg_dist_m", "min_gap_m",
+                     "det_latency_s", "tts_fault_s", "deg_dist_m", "min_gap_m", "traffic",
                      "time_to_stop_s", "collisions", "collision_types", "wall_s"])
         interrupted = False
         for i, case in enumerate(cases):
@@ -674,6 +730,7 @@ def run(args):
                    sx, sy, ov, pct,
                    detail.get("det_latency_s", ""), detail.get("tts_fault_s", ""),
                    detail.get("deg_dist_m", ""), detail.get("min_gap_m", ""),
+                   detail.get("traffic", ""),
                    detail.get("time_to_stop_s", ""),
                    n_coll, coll_types, wall]
             wr.writerow(row)
