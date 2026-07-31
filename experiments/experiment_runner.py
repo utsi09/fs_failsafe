@@ -64,7 +64,11 @@ JUNCTION_STUCK_S = 100.0
 # red-light wait en route to the shoulder can exceed 60 s — give MRM_MOVE
 # three full cycles before calling it stuck
 MRM_MOVE_STUCK_S = 150.0
-CARLA_RESTART_EVERY = 5    # cases between preemptive CARLA restarts
+# fresh CARLA per case: the server degrades progressively (boot 57s -> 150s+
+# by case 3-4, sim-rate drop re-flaps the 3 s diag timeouts and poisons
+# verdicts). ~1 min/restart is cheaper than a wasted 7-min case, and a fresh
+# world per case is better experimental hygiene anyway (no leftover actors).
+CARLA_RESTART_EVERY = 1
 
 # ---------------------------------------------------------------- case matrix
 # per-fault severity values (units differ: ln meters, cn pixel sigma 0-255,
@@ -80,7 +84,11 @@ SEV_LEVELS = ["mid", "high"]
 # noise; cf: camera destroyed; lf: front lidar destroyed; nf: no-fault control
 FAULT_KINDS = ["ln", "cn", "imn", "gn", "cf", "lf", "nf"]
 NO_SEVERITY = {"cf", "lf", "nf"}  # no severity dimension (nf: no trigger either)
-TRIGGER_TIMES = [10, 30]
+# fault time is a RANDOM COVARIATE, not a matrix dimension: fixed trigger
+# times pinned the fault to the same spots so the supervisor always picked
+# the same shoulder. Per-case t is drawn deterministically from the cell key
+# (reproducible; ours/baseline share it like TM_SEED) and recorded in the CSV.
+TRIGGER_RANGE = (10, 45)   # goal_planner owns the last ~25 s of the ~85 s drive
 NPC_STYLES = ["def", "agg"]
 METHODS = ["ours", "baseline"]      # baseline = stock Autoware MRM (in-lane stop)
 REPEATS = 15
@@ -94,25 +102,30 @@ def build_cases(args):
                  "sev": args.sev or "mid",
                  "t": args.t if args.t is not None else 40,
                  "npc": args.npc or "def", "rep": 0} for m in methods]
+    import random
     cases = []
-    for method, fault, sev, t, npc, rep in itertools.product(
-            methods, FAULT_KINDS, SEV_LEVELS, TRIGGER_TIMES, NPC_STYLES,
-            range(args.reps if args.reps is not None else REPEATS)):
+    for fault, sev, npc, rep, method in itertools.product(
+            FAULT_KINDS, SEV_LEVELS, NPC_STYLES,
+            range(args.reps if args.reps is not None else REPEATS), methods):
         if fault in NO_SEVERITY and sev != "mid":
             continue  # destruction faults have no severity dimension
-        if fault == "nf" and t != TRIGGER_TIMES[0]:
-            continue  # no-fault control has no trigger-time dimension
+        # reproducible per-cell draw, identical for ours/baseline (paired)
+        t = (args.t if args.t is not None else
+             random.Random(f"{fault}/{sev}/{npc}/{rep}").randint(*TRIGGER_RANGE))
         # full runs: the same flags act as matrix filters
         if args.fault and fault != args.fault:
             continue
         if args.sev and sev != args.sev:
             continue
-        if args.t is not None and t != args.t:
-            continue
         if args.npc and npc != args.npc:
             continue
         cases.append({"method": method, "fault": fault, "sev": sev, "t": t,
                       "npc": npc, "rep": rep})
+    if args.limit:
+        # sanity runs: spread the slice across the matrix instead of taking
+        # the first N (which would all be the same method/fault)
+        step = max(1, len(cases) // args.limit)
+        cases = cases[::step][:args.limit]
     return cases
 
 
@@ -196,8 +209,16 @@ class Procs:
                 subprocess.run(["docker", "exec", container, "pkill", "-9", "-f", pat],
                                capture_output=True)
         # host side (cdr / supervisor / stray launches)
-        for pat in ["cdr_monitor", "mrm_supervisor", "awcl_adapter", "ros2 launch"]:
+        # dump_node included: orphaned dump instances duplicate the node name ->
+        # duplicated_node_checker ERROR -> every mode unavailable -> permanent
+        # emergency stop (three strays found blocking departure, 0731)
+        for pat in ["cdr_monitor", "mrm_supervisor", "awcl_adapter", "ros2 launch",
+                    "diagnostic_graph_utils dump_node"]:
             subprocess.run(["pkill", "-9", "-f", pat], capture_output=True)
+        # the pattern above only matches the `ros2 run` wrapper; killing it -9
+        # orphans the actual dump_node binary (path has a slash, not a space),
+        # and one orphan per case re-triggers duplicated_node_checker
+        subprocess.run(["pkill", "-9", "-x", "dump_node"], capture_output=True)
         # per-launch ROS log dirs are never reused — left alone they grow by
         # thousands of dirs (GBs) over a long campaign
         subprocess.run(["docker", "exec", "-u", "aw", AW_CONTAINER, "bash", "-c",
@@ -528,7 +549,9 @@ class Judge:
 
     def _detail(self):
         px, py = self.pose if self.pose else (float("nan"), float("nan"))
-        t_move = self.state_times.get("MRM_MOVE")
+        # states carry the target ("MRM_MOVE:shoulder_X") — exact get() never hit
+        t_move = min((t for s_, t in self.state_times.items()
+                      if s_.startswith("MRM_MOVE")), default=None)
         t_end = self.stopped_since or time.time()
         tts = (t_end - t_move) if t_move else float("nan")
         det, tts_fault = "", ""
@@ -673,8 +696,9 @@ def run(args):
                 break
             # UE4 leaks memory on every load_world; a preemptive restart
             # beats waiting for the slow-then-crash phase
-            if i > 0 and i % CARLA_RESTART_EVERY == 0 and not args.dry:
-                restart_carla(False)
+            if i % CARLA_RESTART_EVERY == 0 and not args.dry:
+                restart_carla(False)   # case 0 included: never start a
+                                       # campaign on an hours-old server
             if not args.dry and not (carla_alive() and carla_responsive(False)
                                      and carla_unstick(False)):
                 if not restart_carla(args.dry):
@@ -758,6 +782,8 @@ if __name__ == "__main__":
                     help="npc style (smoke: sets it; full run: filters matrix)")
     ap.add_argument("--reps", type=int,
                     help=f"repetitions per cell (default {REPEATS})")
+    ap.add_argument("--limit", type=int,
+                    help="run only N cases, sampled evenly across the matrix")
     ap.add_argument("--dg", default="-102:95:-8",
                     help='final goal: default "-102:95:-8" — 354 m route through '
                          'the tagged-shoulder corridor (center road west, then '

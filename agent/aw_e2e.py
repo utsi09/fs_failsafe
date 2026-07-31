@@ -344,7 +344,7 @@ class AutowareE2EAgent(TUMROSBaseAgent):
                     if v.attributes.get("role_name") in ("hero", "ego_vehicle"):
                         continue
                     tm.vehicle_percentage_speed_difference(v, -20.0)  # 20% above limit
-                    tm.distance_to_leading_vehicle(v, 0.5)            # tailgating
+                    tm.distance_to_leading_vehicle(v, 1.2)            # tailgating (0.5 pinned stopped egos)
                     tm.ignore_vehicles_percentage(v, 20.0)            # yields less
                     tm.ignore_lights_percentage(v, 10.0)              # runs some lights
                     styled += 1
@@ -369,8 +369,10 @@ class AutowareE2EAgent(TUMROSBaseAgent):
         # tail=<gap_m>: keep a chasing NPC behind the ego for the WHOLE case.
         # A one-shot spawn drifts away (the TM picks its own turns at
         # junctions) — re-check every ~5 s and respawn when lost/far.
-        if (self._is_autonomous and self._counter > 40
-                and self._counter % 100 == 0
+        # Spawn only AFTER the ego starts driving (_fault_t0 arms then): an
+        # aggressive tail (0.5 m gap) parked on the bumper of the not-yet-
+        # departed ego blocks departure entirely (AgentBlockedTest failures).
+        if (self._fault_t0 is not None and self._counter % 100 == 0
                 and self.ros_node.get_parameter("tail").value):
             try:
                 gap = float(self.ros_node.get_parameter("tail").value)
@@ -405,7 +407,10 @@ class AutowareE2EAgent(TUMROSBaseAgent):
                             tm = client.get_trafficmanager(tm_port)
                             npc.set_autopilot(True, tm_port)
                             aggressive = os.environ.get("npc", "") == "agg"
-                            tm.distance_to_leading_vehicle(npc, 0.5 if aggressive else 2.0)
+                            # 0.5 m glued to the bumper at every stop and the
+                            # ego could never resume -> permanent pin. 1.5 m
+                            # still threatens but allows restart.
+                            tm.distance_to_leading_vehicle(npc, 1.5 if aggressive else 2.5)
                             tm.vehicle_percentage_speed_difference(
                                 npc, -30.0 if aggressive else -10.0)
                             tm.ignore_lights_percentage(npc, 30.0 if aggressive else 0.0)

@@ -110,6 +110,8 @@ class Supervisor(Node):
         self._select_failures = 0
         self._blacklist = set()      # candidates goal_planner failed to park at
         self._stuck_since = None
+        self._accept_time = None
+        self._accept_pose = None
 
         qos = QoSProfile(depth=1, durability=DurabilityPolicy.VOLATILE)
         self.create_subscription(DiagnosticArray, "/monitor/scores", self._scores_cb, qos)
@@ -300,6 +302,31 @@ class Supervisor(Node):
                                      f"(d={d:.1f}m, lat={lat:.1f}m, "
                                      f"route_state={self.route_state})")
                     return
+                # creep guard: noisy-lidar phantom stops can keep the ego
+                # crawling (0.2-1 m/s) forever — below the full-stop stall
+                # detector. If 90 s after accept we have moved <25 m, the
+                # exposure outweighs the pull-over benefit: try the next
+                # candidate (exhausted -> DEFER).
+                if (self._goal_accepted and self._accept_time is not None
+                        and self._accept_pose is not None
+                        and (self.get_clock().now() - self._accept_time).nanoseconds > 90e9
+                        and math.dist(self.pose, self._accept_pose) < 25.0):
+                    self._blacklist.add(self._chosen.name)
+                    self.get_logger().error(
+                        f"crawling: <25 m progress in 90 s toward "
+                        f"{self._chosen.name} — trying next candidate")
+                    self._goal_sent = False
+                    self._goal_accepted = False
+                    self._accept_time = None
+                    best = self._select_candidate(cap_loc)
+                    if best is None:
+                        self._transition("MRM_DEFER",
+                                         "no viable candidate left — stock MRM")
+                        return
+                    self._chosen = best
+                    self._publish_state()
+                    self.get_logger().warn(f"fallback target: {best.name}")
+                    return
                 # goal_planner can end up with "no path candidate" (too-narrow
                 # or overshot shoulder): ego stalls without ever reaching the
                 # shoulder. Blacklist that candidate and fall back to the next.
@@ -440,6 +467,8 @@ class Supervisor(Node):
             else:
                 self._goal_accepted = True
                 self._noresp = 0
+                self._accept_time = self.get_clock().now()
+                self._accept_pose = self.pose
                 self.get_logger().warn("route change ACCEPTED by Autoware")
         except Exception as e:
             self.get_logger().error(f"route change failed: {e} — retrying")

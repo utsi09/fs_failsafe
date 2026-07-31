@@ -1,5 +1,5 @@
 diff --git a/src/tum_agents/autoware_agent/aw_e2e.py b/src/tum_agents/autoware_agent/aw_e2e.py
-index 1b56a0a..fa005db 100644
+index 1b56a0a..23ce596 100644
 --- a/src/tum_agents/autoware_agent/aw_e2e.py
 +++ b/src/tum_agents/autoware_agent/aw_e2e.py
 @@ -9,6 +9,7 @@ This module provides a ROS autonomous agent interface to control the ego vehicle
@@ -106,7 +106,7 @@ index 1b56a0a..fa005db 100644
          self._traffic_light_ids = set()  
  
          self._steps_before_init = 0
-@@ -201,13 +253,218 @@ class AutowareE2EAgent(TUMROSBaseAgent):
+@@ -201,13 +253,223 @@ class AutowareE2EAgent(TUMROSBaseAgent):
  
          return sensors
  
@@ -203,7 +203,7 @@ index 1b56a0a..fa005db 100644
 +                    if v.attributes.get("role_name") in ("hero", "ego_vehicle"):
 +                        continue
 +                    tm.vehicle_percentage_speed_difference(v, -20.0)  # 20% above limit
-+                    tm.distance_to_leading_vehicle(v, 0.5)            # tailgating
++                    tm.distance_to_leading_vehicle(v, 1.2)            # tailgating (0.5 pinned stopped egos)
 +                    tm.ignore_vehicles_percentage(v, 20.0)            # yields less
 +                    tm.ignore_lights_percentage(v, 10.0)              # runs some lights
 +                    styled += 1
@@ -228,8 +228,10 @@ index 1b56a0a..fa005db 100644
 +        # tail=<gap_m>: keep a chasing NPC behind the ego for the WHOLE case.
 +        # A one-shot spawn drifts away (the TM picks its own turns at
 +        # junctions) — re-check every ~5 s and respawn when lost/far.
-+        if (self._is_autonomous and self._counter > 40
-+                and self._counter % 100 == 0
++        # Spawn only AFTER the ego starts driving (_fault_t0 arms then): an
++        # aggressive tail (0.5 m gap) parked on the bumper of the not-yet-
++        # departed ego blocks departure entirely (AgentBlockedTest failures).
++        if (self._fault_t0 is not None and self._counter % 100 == 0
 +                and self.ros_node.get_parameter("tail").value):
 +            try:
 +                gap = float(self.ros_node.get_parameter("tail").value)
@@ -264,7 +266,10 @@ index 1b56a0a..fa005db 100644
 +                            tm = client.get_trafficmanager(tm_port)
 +                            npc.set_autopilot(True, tm_port)
 +                            aggressive = os.environ.get("npc", "") == "agg"
-+                            tm.distance_to_leading_vehicle(npc, 0.5 if aggressive else 2.0)
++                            # 0.5 m glued to the bumper at every stop and the
++                            # ego could never resume -> permanent pin. 1.5 m
++                            # still threatens but allows restart.
++                            tm.distance_to_leading_vehicle(npc, 1.5 if aggressive else 2.5)
 +                            tm.vehicle_percentage_speed_difference(
 +                                npc, -30.0 if aggressive else -10.0)
 +                            tm.ignore_lights_percentage(npc, 30.0 if aggressive else 0.0)
@@ -327,7 +332,7 @@ index 1b56a0a..fa005db 100644
          # Autoware Timing
          if self._aw_time is None:
              self._steps_before_init += 1
-@@ -227,6 +484,9 @@ class AutowareE2EAgent(TUMROSBaseAgent):
+@@ -227,6 +489,9 @@ class AutowareE2EAgent(TUMROSBaseAgent):
          ndt_pose_msg.header.frame_id = "map"
          ndt_pose_msg.pose.pose.position = Point(**position["position"])
          ndt_pose_msg.pose.pose.orientation = Quaternion(**position["orientation"])
@@ -337,7 +342,7 @@ index 1b56a0a..fa005db 100644
          self._gnss_pose_pub.publish(ndt_pose_msg)
  
          # Steering Angle
-@@ -266,6 +526,14 @@ class AutowareE2EAgent(TUMROSBaseAgent):
+@@ -266,6 +531,14 @@ class AutowareE2EAgent(TUMROSBaseAgent):
              z=velocity["orientation"]["yaw"]
          )
          imu_msg.linear_acceleration = Vector3(**loc_acc["position"])
@@ -352,7 +357,7 @@ index 1b56a0a..fa005db 100644
          self._imu_pub.publish(imu_msg)
          
          if self._use_v2x_traffic_light:
-@@ -303,9 +571,11 @@ class AutowareE2EAgent(TUMROSBaseAgent):
+@@ -303,9 +576,11 @@ class AutowareE2EAgent(TUMROSBaseAgent):
          except queue.Empty:
              control_timestamp, control = timestamp, self._last_control
  
@@ -367,7 +372,7 @@ index 1b56a0a..fa005db 100644
  
          return control
  
-@@ -314,7 +584,7 @@ class AutowareE2EAgent(TUMROSBaseAgent):
+@@ -314,7 +589,7 @@ class AutowareE2EAgent(TUMROSBaseAgent):
          return AutowareE2EAgent.ROS_VERSION
  
      def set_global_plan(self, global_plan_gps, global_plan_world_coord):
@@ -376,7 +381,7 @@ index 1b56a0a..fa005db 100644
          
          # Ensure the last waypoint is included
          if ds_ids[-1] != len(global_plan_world_coord) - 1:
-@@ -343,7 +613,15 @@ class AutowareE2EAgent(TUMROSBaseAgent):
+@@ -343,7 +618,15 @@ class AutowareE2EAgent(TUMROSBaseAgent):
  
          return (current_wp.transform, global_plan_world_coord[-1][1])
  
@@ -392,7 +397,7 @@ index 1b56a0a..fa005db 100644
          if not self._global_plan_world_coord:
              return
  
-@@ -359,6 +637,14 @@ class AutowareE2EAgent(TUMROSBaseAgent):
+@@ -359,6 +642,14 @@ class AutowareE2EAgent(TUMROSBaseAgent):
                  return  
  
          total_waypoints = len(self._global_plan_world_coord)
@@ -407,7 +412,7 @@ index 1b56a0a..fa005db 100644
          is_last_waypoint = self._route_index >= total_waypoints - 1
  
          # --- Advance route index based on distance ---
-@@ -401,23 +687,45 @@ class AutowareE2EAgent(TUMROSBaseAgent):
+@@ -401,23 +692,45 @@ class AutowareE2EAgent(TUMROSBaseAgent):
              # Final goal MUST be published via topic so Autoware registers scenario completion
              goal_pose_stamped = PoseStamped()
              goal_pose_stamped.header.frame_id = "map"
@@ -460,7 +465,7 @@ index 1b56a0a..fa005db 100644
              service_request.goal = Pose(
                  position=Point(**next_pose_dict["position"]),
                  orientation=Quaternion(**next_pose_dict["orientation"])
-@@ -441,7 +749,7 @@ class AutowareE2EAgent(TUMROSBaseAgent):
+@@ -441,7 +754,7 @@ class AutowareE2EAgent(TUMROSBaseAgent):
                  self._published_latest = True
                  self._goal_mod_failure_counter = 0
  
