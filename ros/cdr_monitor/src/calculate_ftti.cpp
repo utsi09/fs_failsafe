@@ -41,6 +41,9 @@ PortsList CalculateFtti::providedPorts() {
         InputPort<double>("ttc_ext_ms"),
         InputPort<string>("important_sensors"),
         InputPort<string>("ttc_source_sensors"),
+        // 데드라인 상한(기존 하드코딩 850ms)과 TTC 동적 조임의 파라미터화
+        InputPort<double>("fresh_ms", 850.0, "sensor freshness deadline upper bound [ms]"),
+        InputPort<bool>("ttc_dynamic", true, "min(fresh, TTC) dynamic tightening on/off"),
     };
 }
 NodeStatus CalculateFtti::tick() {
@@ -54,6 +57,12 @@ NodeStatus CalculateFtti::tick() {
     getInput("vel_x", vel_x);
     getInput("vel_y", vel_y);
     double vel = calculate_vel(vel_x, vel_y);
+
+    // fresh_ms: 데드라인 상한 (기본 850ms). ttc_dynamic=false면 TTC로 조이지 않음
+    double fresh_ms = 850.0;
+    bool ttc_dynamic = true;
+    getInput("fresh_ms", fresh_ms);
+    getInput("ttc_dynamic", ttc_dynamic);
 
     getInput("important_sensors", important_sensors);
 
@@ -103,37 +112,50 @@ NodeStatus CalculateFtti::tick() {
         (void)bb->get(n + "_quality_score", q);
         if (failed || q < 0.7) { source_healthy = false; break; }
     }
-    // Hold is time-limited: it bridges transient detection dropouts, but a
-    // persistent fault is already punished by the quality score — keeping a
-    // frozen small TTC forever double-penalizes and collapses the score
-    // below the DEFER floor (band design breaks: shoulder pull-over never
-    // gets to run).
+    // TTC 하한 감쇠 (Emzivat 방향): 마지막 신뢰 TTC를 얼려두지 않고 경과시간만큼
+    // 감소시킨다 — ttc_hold(t) = ttc_last − elapsed_ms.
+    // worst-case propagation: 마지막 관측 장애물이 같은 접근속도로 계속 다가온다고
+    // 가정. 0 이하로 떨어지면 최대 감점(TTC=0 → FTTI=0)을 한 번 적용한 뒤 홀드를
+    // 해제한다 — 지속 고장은 품질 점수가 이미 벌점하므로 영구 홀드는 이중 처벌.
     if (source_healthy) {
         trusted_ttc_ = ttc;
         was_unhealthy_ = false;
+        hold_expired_ = false;
     } else {
         if (!was_unhealthy_) {
             was_unhealthy_ = true;
+            hold_expired_ = false;
             unhealthy_since_ = std::chrono::steady_clock::now();
         }
-        const double held_s = std::chrono::duration<double>(
+        const double elapsed_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - unhealthy_since_).count();
-        if (held_s < 5.0 && trusted_ttc_ < ttc) {
-            cout << "ttc source unhealthy: hold " << trusted_ttc_
-                 << "ms (measured " << ttc << "ms, " << held_s << "s)" << endl;
-            ttc = trusted_ttc_;
+        const double ttc_hold = trusted_ttc_ - elapsed_ms;
+        if (!hold_expired_) {
+            if (ttc_hold <= 0.0) {
+                cout << "ttc hold decayed to 0: max penalty, then release" << endl;
+                ttc = 0.0;              // 최대 감점 후
+                hold_expired_ = true;   // 홀드 해제 (이후 측정값 사용)
+            } else if (ttc_hold < ttc) {
+                cout << "ttc source unhealthy: hold " << ttc_hold
+                     << "ms (measured " << ttc << "ms, decayed " << elapsed_ms
+                     << "ms)" << endl;
+                ttc = ttc_hold;
+            }
         }
     }
 
     for (const auto& name : lidar_names) {
-        ftti_map[name] = 850.0;
+        ftti_map[name] = fresh_ms;
     }
     for (const auto& name : camera_names) {
-        ftti_map[name] = 850.0;
+        ftti_map[name] = fresh_ms;
     }
-    for (const auto& name : important_sensors_names) {
-        if (ttc < 850.0)
-            ftti_map[name] = ttc;
+    // ttc_dynamic=true일 때만 중요 센서의 데드라인을 min(fresh_ms, TTC)로 조임
+    if (ttc_dynamic) {
+        for (const auto& name : important_sensors_names) {
+            if (ttc < fresh_ms)
+                ftti_map[name] = ttc;
+        }
     }
 
     for (auto& [name,value] : ftti_map){

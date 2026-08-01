@@ -177,6 +177,10 @@ class AutowareE2EAgent(TUMROSBaseAgent):
         #   cf=20       destroy camera 20 s in (image freezes downstream)
         #   cn=20:15    respawn camera at 20 s with gaussian pixel noise (sigma 15 on 0-255)
         #   ln=20:0.1   respawn lidars at 20 s with CARLA-native noise_stddev=0.1 m
+        #   imb=20:0.02 constant gyro z (yaw-rate) bias of 0.02 rad/s from 20 s on
+        #   rain=20     switch the CARLA weather to a heavy downpour at 20 s
+        #   gb=20:30    GNSS blackout: stop the GNSS pose publish for 30 s
+        #               (duration omitted = blackout forever)
         # Runtime override:
         #   ros2 param set /autoware_e2e_node cf true
         #   ros2 param set /autoware_e2e_node cn "0:15"      (0 = trigger now)
@@ -198,6 +202,12 @@ class AutowareE2EAgent(TUMROSBaseAgent):
             self.ros_node.declare_parameter("lnr", os.environ.get("lnr", ""))
             self.ros_node.declare_parameter("imn", os.environ.get("imn", ""))
             self.ros_node.declare_parameter("gn", os.environ.get("gn", ""))
+            # imb=<t>:<bias_rad_s>: constant gyro z bias (see run_step)
+            self.ros_node.declare_parameter("imb", os.environ.get("imb", ""))
+            # rain=<t>: heavy-rain weather preset (lidar/camera degrade physically)
+            self.ros_node.declare_parameter("rain", os.environ.get("rain", ""))
+            # gb=<t>[:<dur_s>]: GNSS blackout (publish gated in this agent)
+            self.ros_node.declare_parameter("gb", os.environ.get("gb", ""))
             # tail=<gap_m>: guarantee an NPC tailing the ego at <gap_m> meters
             # (background traffic spawns mostly ahead — rear-end pressure for
             # in-lane MRM stops needs an explicit chaser)
@@ -213,6 +223,9 @@ class AutowareE2EAgent(TUMROSBaseAgent):
         self._npc_styled = False
         self._imu_noise_sigma = 0.0
         self._gnss_noise_sigma = 0.0
+        self._imu_gyro_bias = 0.0
+        self._rain_applied = False
+        self._gnss_blackout = False
 
         # V2X sens gt traffic light states
         # Either the camera image or the v2x need to be set true
@@ -461,11 +474,53 @@ class AutowareE2EAgent(TUMROSBaseAgent):
         spec = self._parse_fault(self.ros_node.get_parameter("gn").value, 1.0)
         self._gnss_noise_sigma = spec[1] if spec and fault_elapsed >= spec[0] else 0.0
 
+        # imb=<t>:<bias_rad_s>: constant gyro z (yaw-rate) bias from t on.
+        # White noise (imn) is zero-mean and gets absorbed by the EKF's
+        # measurement update, but a constant bias is INTEGRATED into a
+        # steadily growing yaw error — the dangerous real-world MEMS IMU
+        # failure mode is bias instability, not white noise (Allan-variance
+        # bias-instability term, IEEE Std 952 / El-Sheimy et al. 2008).
+        spec = self._parse_fault(self.ros_node.get_parameter("imb").value, 0.02)
+        self._imu_gyro_bias = spec[1] if spec and fault_elapsed >= spec[0] else 0.0
+
+        # rain=<t>: switch the CARLA weather to a heavy downpour at t.
+        # Environmental (not component) degradation: rain physically
+        # attenuates/scatters lidar returns and degrades the camera image,
+        # so every exteroceptive sensor worsens at once. One-shot;
+        # keeps the current sun position, only precipitation-related
+        # fields are overridden (CARLA 0.9.16 carla.WeatherParameters).
+        if not self._rain_applied:
+            spec = self._parse_fault(self.ros_node.get_parameter("rain").value, 0.0)
+            if spec and fault_elapsed >= spec[0]:
+                try:
+                    world = CarlaDataProvider.get_world()
+                    weather = world.get_weather()
+                    weather.cloudiness = 90.0
+                    weather.precipitation = 90.0
+                    weather.precipitation_deposits = 80.0
+                    weather.wetness = 80.0
+                    weather.fog_density = 20.0
+                    world.set_weather(weather)
+                    print(f"[FAULT INJECTION] heavy rain applied at t+{spec[0]:.0f}s")
+                except Exception as e:
+                    print("[FAULT INJECTION] weather change failed:", e)
+                self._rain_applied = True
+
+        # gb=<t>[:<dur_s>]: GNSS blackout — this agent publishes the GNSS
+        # pose itself (see the GNSS-PosePub block below), so the blackout is
+        # a publish gate right here, NOT a bridge noise parameter like gn.
+        # The topic simply goes silent (tunnel / urban-canyon outage),
+        # exercising the monitor's timeout path instead of its noise path.
+        # Duration omitted -> blackout lasts for the rest of the run.
+        spec = self._parse_fault(self.ros_node.get_parameter("gb").value, float("inf"))
+        self._gnss_blackout = bool(spec) and spec[0] <= fault_elapsed < spec[0] + spec[1]
+
         # single latched "fault is now live" signal for the experiment judge
         if not self._fault_announced and (
                 self._bridge_noise_started or self._camera_killed
                 or self._lidar_killed or self._imu_noise_sigma > 0.0
-                or self._gnss_noise_sigma > 0.0):
+                or self._gnss_noise_sigma > 0.0 or self._imu_gyro_bias != 0.0
+                or self._rain_applied or self._gnss_blackout):
             self._fault_announced = True
             self._fault_active_pub.publish(Bool(data=True))
             print(f"[FAULT INJECTION] fault ACTIVE at t+{fault_elapsed:.1f}s (announced)")
@@ -492,7 +547,9 @@ class AutowareE2EAgent(TUMROSBaseAgent):
         if self._gnss_noise_sigma > 0.0:
             ndt_pose_msg.pose.pose.position.x += float(np.random.normal(0.0, self._gnss_noise_sigma))
             ndt_pose_msg.pose.pose.position.y += float(np.random.normal(0.0, self._gnss_noise_sigma))
-        self._gnss_pose_pub.publish(ndt_pose_msg)
+        # gb: during a GNSS blackout the pose is simply not published
+        if not self._gnss_blackout:
+            self._gnss_pose_pub.publish(ndt_pose_msg)
 
         # Steering Angle
         steering_angle = self._awp_converter._get_steering()
@@ -539,6 +596,10 @@ class AutowareE2EAgent(TUMROSBaseAgent):
             imu_msg.linear_acceleration.x += float(np.random.normal(0.0, 10.0 * s))
             imu_msg.linear_acceleration.y += float(np.random.normal(0.0, 10.0 * s))
             imu_msg.linear_acceleration.z += float(np.random.normal(0.0, 10.0 * s))
+        # imb: constant yaw-rate bias on the gyro z axis (integrates into a
+        # growing heading error downstream — see the imb comment in run_step)
+        if self._imu_gyro_bias != 0.0:
+            imu_msg.angular_velocity.z += float(self._imu_gyro_bias)
         self._imu_pub.publish(imu_msg)
         
         if self._use_v2x_traffic_light:

@@ -64,6 +64,16 @@ int main(int argc, char** argv)
     blackboard->set("ttc_ext_ms", -1.0);
     blackboard->set("important_sensors", std::string(""));
 
+    // 데드라인 상한과 TTC 동적 조임을 ROS 파라미터로 노출 (launch 인자에서 주입)
+    shared_node->declare_parameter<double>("fresh_ms", 850.0);
+    shared_node->declare_parameter<bool>("ttc_dynamic", true);
+    double fresh_ms = 850.0;
+    bool ttc_dynamic = true;
+    shared_node->get_parameter("fresh_ms", fresh_ms);
+    shared_node->get_parameter("ttc_dynamic", ttc_dynamic);
+    blackboard->set("fresh_ms", fresh_ms);
+    blackboard->set("ttc_dynamic", ttc_dynamic);
+
     std::vector<SensorTypeInfo> type_infos = {
         {"lidar",  "LidarChecker", "lidar_ftti"},
         {"camera", "CamChecker",   "cam_ftti"},
@@ -142,6 +152,7 @@ int main(int argc, char** argv)
               nearest_obstacle="{@nearest_obstacle}"
               ttc_ext_ms="{@ttc_ext_ms}"
               important_sensors="{@important_sensors}"
+              fresh_ms="{@fresh_ms}" ttc_dynamic="{@ttc_dynamic}"
               lidar_names="{@lidar_names}" camera_names="{@camera_names}"/>
 
       <ForceSuccess>

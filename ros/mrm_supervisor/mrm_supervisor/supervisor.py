@@ -22,12 +22,14 @@ cost(c) = w_time * eta
         + w_loc * eta * (1 - localization_score)
 """
 import math
+from collections import deque
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, DurabilityPolicy
+from rclpy.qos import QoSProfile, DurabilityPolicy, qos_profile_sensor_data
 
 from std_msgs.msg import String
+from sensor_msgs.msg import Imu
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Pose, Point, Quaternion, PoseWithCovarianceStamped
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
@@ -74,6 +76,14 @@ class Supervisor(Node):
         self.declare_parameter("tl_camera_fovs_deg", [90.0])
         self.declare_parameter("tl_visible_min_score", 0.5)
         self.declare_parameter("tl_bearing_deg", 30.0)  # signals sit within +-30 deg ahead
+        # v2: raw-IMU watch (see _imu_cb). Topic follows the /sensing/* naming
+        # of the other raw-input subscriptions (cdr sensors_awcl.yaml uses the
+        # same /sensing/imu/imu_data).
+        self.declare_parameter("imu_topic", "/sensing/imu/imu_data")
+        self.declare_parameter("imu_window_s", 3.0)     # sliding evaluation window
+        self.declare_parameter("imu_calib_s", 3.0)      # boot baseline window
+        self.declare_parameter("imu_var_ratio", 25.0)   # (a) variance vs baseline
+        self.declare_parameter("imu_bias_thresh", 0.2)  # (b) mean offset [rad/s]
 
         map_path = self.get_parameter("map_path").value
         self.map = MapModel(map_path)
@@ -94,6 +104,20 @@ class Supervisor(Node):
         self._meas_base = 0.0      # static frame offset learned at boot
         self._meas_n = 0
         self._last_odom = None
+        # v2: raw-IMU health (angular velocity z) — noise/bias scores
+        self.imu_noise_score = 1.0
+        self.imu_bias_score = 1.0
+        self._imu_win = deque()    # (t, wz) samples inside imu_window_s
+        self._imu_t0 = None
+        self._imu_calib_n = 0      # Welford accumulators for the boot baseline
+        self._imu_dmean = 0.0      # mean of first differences (noise baseline)
+        self._imu_base_m2 = 0.0    # M2 of first differences
+        self._imu_base_mean = 0.0  # mean of raw gyro z (bias baseline)
+        self._imu_mean_sum = 0.0
+        self._imu_mean_n = 0
+        # v2: sensors whose quality estimate itself is invalid (cdr v2
+        # quality_valid=false) — counted separately from scored sensors
+        self.unknown_sensors = set()
 
         self.state = "NORMAL"
         # armed only after real scores show a healthy system once — startup
@@ -129,6 +153,13 @@ class Supervisor(Node):
         self.create_subscription(
             PoseWithCovarianceStamped, "/sensing/gnss/pose_with_covariance",
             self._meas_pose_cb, qos)
+        # 잔차 기반 감시의 IMU 사각지대(백색노이즈 흡수·바이어스 누적) 보완 —
+        # v1 캠페인에서 imn 40/40 미감지 실증. EKF 출력(loc_jump)도
+        # 입력-출력 잔차(loc_meas)도 자이로 백색노이즈는 흡수해 버리고
+        # 바이어스는 천천히 누적되므로, 원신호를 직접 본다.
+        self.create_subscription(
+            Imu, self.get_parameter("imu_topic").value,
+            self._imu_cb, qos_profile_sensor_data)
 
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.state_pub = self.create_publisher(String, "/mrm_supervisor/state", latched)
@@ -147,12 +178,88 @@ class Supervisor(Node):
     # ------------------------------------------------------------- callbacks
     def _scores_cb(self, msg):
         for st in msg.status:
+            quality_valid = True
             for kv in st.values:
                 if kv.key == "score":
                     try:
                         self.scores[st.name] = float(kv.value)
                     except ValueError:
                         pass
+                elif kv.key == "quality_valid" and kv.value.strip().lower() == "false":
+                    quality_valid = False
+            # cdr v2: quality_valid=false — the quality estimate itself is not
+            # trustworthy (e.g. not enough data to judge). Treat the sensor as
+            # UNKNOWN: keep a separate count, and weigh it conservatively as
+            # 0.5 in health computations (see _score) instead of trusting a
+            # possibly-optimistic score.
+            if not quality_valid:
+                if st.name not in self.unknown_sensors:
+                    self.get_logger().warn(
+                        f"{st.name}: quality_valid=false -> UNKNOWN "
+                        f"(now {len(self.unknown_sensors) + 1} unknown)")
+                self.unknown_sensors.add(st.name)
+            else:
+                self.unknown_sensors.discard(st.name)
+
+    def _score(self, name, default=1.0):
+        """Score lookup that caps UNKNOWN (quality_valid=false) sensors at a
+        conservative 0.5: never trust an unverifiable sensor to be healthier
+        than 'degraded', but keep an even worse reported score if present."""
+        s = self.scores.get(name, default)
+        return min(s, 0.5) if name in self.unknown_sensors else s
+
+    def _imu_cb(self, msg):
+        """v2: raw gyro-z watch. 잔차 기반 감시의 IMU 사각지대(백색노이즈
+        흡수·바이어스 누적) 보완 — v1 캠페인에서 imn 40/40 미감지 실증.
+        (a) imu_noise: 최근 3초 창의 표본 분산이 부팅(정지/직진) 기준선의
+            imu_var_ratio배(기본 25배)를 초과하면 이상. 선회 시 실제 yaw
+            운동이 창 분산에 섞이지 않도록 1차 차분(고주파 성분)의 분산으로
+            비교한다 — 백색노이즈는 차분에서 2σ²로 그대로 보이고, 저주파의
+            실제 회전 운동은 소거된다.
+        (b) imu_bias: 창의 이동평균이 부팅 기준선 대비 imu_bias_thresh(기본
+            0.2 rad/s) 이상 오프셋이면 이상. 장시간 선회는 임계 근처까지
+            접근할 수 있으므로 임계는 파라미터로 조정 가능하다."""
+        wz = msg.angular_velocity.z
+        t = rclpy.time.Time.from_msg(msg.header.stamp).nanoseconds / 1e9
+        if self._imu_t0 is None:
+            self._imu_t0 = t
+        if t - self._imu_t0 < self.get_parameter("imu_calib_s").value:
+            # boot baseline: faults only arm after driving starts, so this
+            # window is clean. Mean of the raw signal for the bias check,
+            # Welford variance of the FIRST DIFFERENCES for the noise check.
+            if self._imu_win:
+                d = wz - self._imu_win[-1][1]       # first difference
+                self._imu_calib_n += 1
+                delta = d - self._imu_dmean
+                self._imu_dmean += delta / self._imu_calib_n
+                self._imu_base_m2 += delta * (d - self._imu_dmean)
+            self._imu_mean_sum += wz
+            self._imu_mean_n += 1
+            self._imu_base_mean = self._imu_mean_sum / self._imu_mean_n
+            self._imu_win.append((t, wz))
+            return
+        win = self.get_parameter("imu_window_s").value
+        self._imu_win.append((t, wz))
+        while self._imu_win and t - self._imu_win[0][0] > win:
+            self._imu_win.popleft()
+        n = len(self._imu_win)
+        if n < 10 or self._imu_calib_n < 5:
+            return
+        # (a) variance of first differences vs boot baseline
+        diffs = [self._imu_win[i][1] - self._imu_win[i - 1][1] for i in range(1, n)]
+        dmean = sum(diffs) / len(diffs)
+        dvar = sum((d - dmean) ** 2 for d in diffs) / len(diffs)
+        base_var = max(self._imu_base_m2 / (self._imu_calib_n - 1), 1e-8)
+        ratio = dvar / base_var
+        n_max = self.get_parameter("imu_var_ratio").value
+        noise_inst = math.exp(-max(0.0, ratio - n_max) / n_max)
+        # (b) window mean offset vs boot baseline mean
+        mean = sum(v for _, v in self._imu_win) / n
+        off = abs(mean - self._imu_base_mean)
+        th = self.get_parameter("imu_bias_thresh").value
+        bias_inst = math.exp(-max(0.0, off - th) / th)
+        self.imu_noise_score = 0.9 * self.imu_noise_score + 0.1 * noise_inst
+        self.imu_bias_score = 0.9 * self.imu_bias_score + 0.1 * bias_inst
 
     def _route_state_cb(self, msg):
         self.route_state = msg.state
@@ -211,9 +318,15 @@ class Supervisor(Node):
     # ------------------------------------------------------------------ tick
     def _tick(self):
         self._publish_defer_diag()
-        perception = self.scores.get("capability/perception", 1.0)
-        cap_loc = min(self.scores.get("capability/localization", 1.0),
-                      self.loc_jump_score, self.loc_meas_score)
+        # v2: periodic state publish alongside the immediate publish inside
+        # _transition — external observers (judge) must never depend on the
+        # latched one-shot alone (v1: detection 0.93 s vs observed 2.2 s)
+        self._publish_state()
+        perception = self._score("capability/perception")
+        # v2: raw-IMU health joins the localization capability via min()
+        imu_health = min(self.imu_noise_score, self.imu_bias_score)
+        cap_loc = min(self._score("capability/localization"),
+                      self.loc_jump_score, self.loc_meas_score, imu_health)
 
         upper = self.get_parameter("upper_threshold").value
         lower = self.get_parameter("lower_threshold").value
@@ -384,7 +497,7 @@ class Supervisor(Node):
         bearing = self.get_parameter("tl_bearing_deg").value
         for name, yaw, fov in zip(names, yaws, fovs):
             covers = abs(yaw) - fov / 2.0 <= bearing   # FOV overlaps [-bearing, bearing]
-            healthy = self.scores.get(f"sensor/{name}", 1.0) >= th
+            healthy = self._score(f"sensor/{name}") >= th
             if covers and healthy:
                 return True
         return False
@@ -395,7 +508,7 @@ class Supervisor(Node):
         src = self.map.nearest_road_lanelet(*self.pose)
         self.get_logger().info(f"selecting from pose ({self.pose[0]:.1f}, {self.pose[1]:.1f}), "
                                f"current lanelet {src}")
-        cap_tl = self.scores.get("capability/traffic_light", 1.0)
+        cap_tl = self._score("capability/traffic_light")
         w_t = self.get_parameter("w_time").value
         tl_wait = self.get_parameter("tl_wait_s").value
         w_tl = self.get_parameter("w_tl").value
@@ -420,7 +533,7 @@ class Supervisor(Node):
                                   f"{n_tl} traffic lights, no healthy camera covers them"))
                 continue
             g = (1.0 / max(cap_tl, 0.05)) - 1.0
-            sector_pen = sum(1.0 - self.scores.get(f"sector/{k}", 1.0)
+            sector_pen = sum(1.0 - self._score(f"sector/{k}")
                              for k in c.required_sectors)
             # exposure time in the degraded state, incl. expected signal waits
             eta = time_s + n_tl * tl_wait
@@ -479,6 +592,9 @@ class Supervisor(Node):
         if state != self.state:
             self.get_logger().warn(f"state {self.state} -> {state}: {why}")
             self.state = state
+            # v2: publish ONCE immediately at the transition (in addition to
+            # the 10 Hz periodic publish in _tick) so the measured detection
+            # latency is the real one, not detection + publish-cycle jitter
             self._publish_state()
 
     def _publish_state(self):
