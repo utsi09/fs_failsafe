@@ -134,7 +134,13 @@ public:
             if (k < 0.0) k = 0.5 * baseline_;   // 기본 슬랙: baseline의 0.5배
             const double excess = noise_est - baseline_;
             cusum_s_ = std::max(0.0, cusum_s_ + excess - k);
-            if (cusum_s_ > h) quality = std::min(quality, 0.2);
+            // [v2 비활성] 카메라 화소차분은 주행 중 장면 이동(optical flow)로
+            // 자연 상승(정지 기준선 3.8 -> 주행 6.4 실측)해 CUSUM이 구조적으로
+            // 오적산됨(nf에서 S=1257 도달, 무고장 DEFER 유발). 속도 종속
+            // 신호에는 누적 검정 부적합 — 기하 기반이라 속도 무관인 라이다
+            // CUSUM만 유지한다. (cusum_s_ 값은 기록용으로 계속 계산)
+            // if (cusum_s_ > h) quality = std::min(quality, 0.2);
+            (void)h;
         }
 
         publish(quality, true);

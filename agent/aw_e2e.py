@@ -226,6 +226,7 @@ class AutowareE2EAgent(TUMROSBaseAgent):
         self._imu_gyro_bias = 0.0
         self._rain_applied = False
         self._gnss_blackout = False
+        self._gb_bridge_sent = False
 
         # V2X sens gt traffic light states
         # Either the camera image or the v2x need to be set true
@@ -514,6 +515,22 @@ class AutowareE2EAgent(TUMROSBaseAgent):
         # Duration omitted -> blackout lasts for the rest of the run.
         spec = self._parse_fault(self.ros_node.get_parameter("gb").value, float("inf"))
         self._gnss_blackout = bool(spec) and spec[0] <= fault_elapsed < spec[0] + spec[1]
+        # the cpp bridge publishes the SAME topic (second publisher), so the
+        # local gate below is not enough — flip the bridge's gnss_mute too
+        # (v2 battery finding: agent-only mute left EKF fully fed)
+        if self._gnss_blackout != self._gb_bridge_sent:
+            try:
+                cli = self.ros_node.create_client(
+                    SetParameters, "/aw_carla_bridge/set_parameters")
+                req = SetParameters.Request()
+                p = RclParameter(name="gnss_mute",
+                                 value=ParameterValue(type=1, bool_value=self._gnss_blackout))
+                req.parameters = [p]
+                cli.call_async(req)
+                self._gb_bridge_sent = self._gnss_blackout
+                print(f"[FAULT INJECTION] bridge gnss_mute={self._gnss_blackout}")
+            except Exception as e:
+                print("[FAULT INJECTION] gnss_mute set failed:", e)
 
         # single latched "fault is now live" signal for the experiment judge
         if not self._fault_announced and (

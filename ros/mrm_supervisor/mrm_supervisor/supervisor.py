@@ -22,6 +22,7 @@ cost(c) = w_time * eta
         + w_loc * eta * (1 - localization_score)
 """
 import math
+import time
 from collections import deque
 
 import rclpy
@@ -108,6 +109,7 @@ class Supervisor(Node):
         self.loc_jump_score = 1.0
         self.loc_meas_score = 1.0  # raw GNSS/NDT pose vs EKF output residual
         self._meas_base = 0.0      # static frame offset learned at boot
+        self._meas_last_recv = None  # GNSS 입력 침묵(staleness) 감지용
         self._meas_n = 0
         self._last_odom = None
         # v2: raw-IMU health (angular velocity z) — noise/bias scores
@@ -277,7 +279,10 @@ class Supervisor(Node):
         else:
             self._imu_noise_bad_since = None
             sustained = False
-        noise_inst = math.exp(-max(0.0, ratio - n_max) / n_max) if sustained else 1.0
+        # [v2 비활성] 진동(분산) 채널: 기준선이 속도 종속(저속 학습치 << 고속
+        # 정상 진동)이라 가속 구간에서 구조적 오탐 — nf 스모크 2회 실측.
+        # 속도-구간별 기준선(binned baseline)로 재도전 예정. 바이어스 채널은 유지.
+        noise_inst = 1.0
         # (b) 바이어스: 같은 창의 "IMU 평균 vs EKF 요레이트 평균" 차이.
         # (EMA는 창평균과 시간 스케일이 달라 선회 과도 구간에서 가짜 차이를
         # 만들었음 -> 동일 창 평균끼리 비교로 교체). 3초 지속 시에만 감점.
@@ -305,6 +310,7 @@ class Supervisor(Node):
         self.route_state = msg.state
 
     def _meas_pose_cb(self, msg):
+        self._meas_last_recv = time.monotonic()
         if self.pose is None:
             return
         # residual between the raw localization measurement and the EKF pose.
@@ -332,7 +338,10 @@ class Supervisor(Node):
         self.speed = math.hypot(vx, vy)
         self.yaw_rate = msg.twist.twist.angular.z
         self._ekf_wz_ema = 0.9 * self._ekf_wz_ema + 0.1 * self.yaw_rate
-        self._ekf_win.append((now, self.yaw_rate))
+        # 'now'는 이 함수 아래쪽에서 정의되므로 여기서 쓰면 UnboundLocalError
+        # (v2 배터리 전 케이스 출발불가 사고의 원인) — 스탬프를 직접 계산한다
+        _t_ekf = rclpy.time.Time.from_msg(msg.header.stamp).nanoseconds / 1e9
+        self._ekf_win.append((_t_ekf, self.yaw_rate))
         now = rclpy.time.Time.from_msg(msg.header.stamp).nanoseconds / 1e9
         if self._last_odom is not None:
             px, py, pt, pv = self._last_odom
@@ -367,6 +376,15 @@ class Supervisor(Node):
         self._publish_state()
         perception = self._score("capability/perception")
         # v2: raw-IMU health joins the localization capability via min()
+        # GNSS 입력 침묵 감지: loc_meas는 콜백에서만 갱신되어 입력이 끊기면
+        # 마지막(건강한) 값에 얼어붙는다 — gb 블랙아웃 미감지의 원인(v2 실측).
+        # 주행 중 1초 이상 무수신이면 잔차 신뢰를 지수 감쇠시킨다.
+        if (self._armed and self.speed > 1.0
+                and self._meas_last_recv is not None):
+            _stale = time.monotonic() - self._meas_last_recv
+            if _stale > 1.0:
+                self.loc_meas_score = min(self.loc_meas_score,
+                                          math.exp(-(_stale - 1.0) / 0.8))
         imu_health = min(self.imu_noise_score, self.imu_bias_score)
         cap_loc = min(self._score("capability/localization"),
                       self.loc_jump_score, self.loc_meas_score, imu_health)

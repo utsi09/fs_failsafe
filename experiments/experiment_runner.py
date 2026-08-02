@@ -866,6 +866,19 @@ def run(args):
                     procs.host_bg(cdr_cmd, "cdr")
                     baseline = "true" if case["method"] == "baseline" else "false"
                     procs.host_bg(SUP_CMD.format(baseline=baseline), "supervisor")
+                else:
+                    # --mrm-off 1차 배터리 실패 원인: cdr/supervisor를 아예 안
+                    # 띄우면 진단 그래프의 두 유닛이 STALE -> autonomous 잠금
+                    # -> 출발 불가. cdr은 정상 기동(점수만 낼 뿐 개입 없음),
+                    # supervisor 유닛은 더미 OK 발행으로 그래프만 만족시킨다.
+                    procs.host_bg(cdr_cmd, "cdr")
+                    procs.host_bg(
+                        "export ROS_DOMAIN_ID=0; "
+                        "export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp; "
+                        "export CYCLONEDDS_URI=/home/taewook/cyclone_localhost.xml; "
+                        "source /opt/ros/humble/setup.bash && "
+                        "python3 /home/taewook/autoware_carla_leaderboard/experiments/dummy_defer.py",
+                        "dummy_defer")
                 # --mrm-off: 모니터·MRM 개입 없이 고장 진행만 관찰 (FTTI 도출)
                 # per-unit graph levels — to identify which unit flaps the MRM
                 procs.host_bg(DUMP_CMD, "diag_dump")
