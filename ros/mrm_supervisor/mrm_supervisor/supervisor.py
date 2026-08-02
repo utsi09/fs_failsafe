@@ -99,6 +99,12 @@ class Supervisor(Node):
         self.scores = {}           # name -> score from /monitor/scores
         self.pose = None           # (x, y)
         self.speed = 0.0
+        self.yaw_rate = 0.0
+        self._ekf_wz_ema = 0.0
+        from collections import deque as _dq
+        self._ekf_win = _dq()             # (t, EKF wz) — IMU 창과 같은 길이
+        self._imu_noise_bad_since = None  # 지속 조건 추적
+        self._imu_bias_bad_since = None
         self.loc_jump_score = 1.0
         self.loc_meas_score = 1.0  # raw GNSS/NDT pose vs EKF output residual
         self._meas_base = 0.0      # static frame offset learned at boot
@@ -221,7 +227,12 @@ class Supervisor(Node):
             접근할 수 있으므로 임계는 파라미터로 조정 가능하다."""
         wz = msg.angular_velocity.z
         t = rclpy.time.Time.from_msg(msg.header.stamp).nanoseconds / 1e9
+        # 주행 전(부팅 정지 상태)의 분산은 ~0이라 기준선으로 쓰면 출발 직후
+        # 정상 진동조차 25배를 넘어 오경보가 난다(v2 스모크에서 실측).
+        # 기준선 학습과 판정 모두 실주행(속도>=1m/s) 이후에만 수행한다.
         if self._imu_t0 is None:
+            if self.speed < 1.0:
+                return
             self._imu_t0 = t
         if t - self._imu_t0 < self.get_parameter("imu_calib_s").value:
             # boot baseline: faults only arm after driving starts, so this
@@ -245,19 +256,48 @@ class Supervisor(Node):
         n = len(self._imu_win)
         if n < 10 or self._imu_calib_n < 5:
             return
-        # (a) variance of first differences vs boot baseline
+        # (a) variance of first differences vs (adaptive) driving baseline.
+        # nf 오탐 재발 원인: 저속 출발 구간에서 배운 기준선이 고속/거친 노면의
+        # 정상 진동 증가를 못 따라감. -> 건강할 때(ratio<5) 기준선을 1%씩
+        # 현재 값 쪽으로 적응시키고(라이다 baseline과 동일 패턴, 급변은 불추종),
+        # 초과는 2초 이상 "지속"될 때만 감점한다(순간 스파이크 무시).
         diffs = [self._imu_win[i][1] - self._imu_win[i - 1][1] for i in range(1, n)]
         dmean = sum(diffs) / len(diffs)
         dvar = sum((d - dmean) ** 2 for d in diffs) / len(diffs)
         base_var = max(self._imu_base_m2 / (self._imu_calib_n - 1), 1e-8)
         ratio = dvar / base_var
         n_max = self.get_parameter("imu_var_ratio").value
-        noise_inst = math.exp(-max(0.0, ratio - n_max) / n_max)
-        # (b) window mean offset vs boot baseline mean
+        if ratio < 5.0:
+            self._imu_base_m2 = 0.99 * self._imu_base_m2 + \
+                0.01 * dvar * (self._imu_calib_n - 1)
+        if ratio > n_max:
+            if self._imu_noise_bad_since is None:
+                self._imu_noise_bad_since = t
+            sustained = t - self._imu_noise_bad_since >= 2.0
+        else:
+            self._imu_noise_bad_since = None
+            sustained = False
+        noise_inst = math.exp(-max(0.0, ratio - n_max) / n_max) if sustained else 1.0
+        # (b) 바이어스: 같은 창의 "IMU 평균 vs EKF 요레이트 평균" 차이.
+        # (EMA는 창평균과 시간 스케일이 달라 선회 과도 구간에서 가짜 차이를
+        # 만들었음 -> 동일 창 평균끼리 비교로 교체). 3초 지속 시에만 감점.
         mean = sum(v for _, v in self._imu_win) / n
-        off = abs(mean - self._imu_base_mean)
+        while self._ekf_win and t - self._ekf_win[0][0] > win:
+            self._ekf_win.popleft()
         th = self.get_parameter("imu_bias_thresh").value
-        bias_inst = math.exp(-max(0.0, off - th) / th)
+        if len(self._ekf_win) >= 5:
+            ekf_mean = sum(v for _, v in self._ekf_win) / len(self._ekf_win)
+            off = abs(mean - ekf_mean)
+        else:
+            off = 0.0
+        if off > th:
+            if self._imu_bias_bad_since is None:
+                self._imu_bias_bad_since = t
+            b_sustained = t - self._imu_bias_bad_since >= 3.0
+        else:
+            self._imu_bias_bad_since = None
+            b_sustained = False
+        bias_inst = math.exp(-max(0.0, off - th) / th) if b_sustained else 1.0
         self.imu_noise_score = 0.9 * self.imu_noise_score + 0.1 * noise_inst
         self.imu_bias_score = 0.9 * self.imu_bias_score + 0.1 * bias_inst
 
@@ -290,6 +330,9 @@ class Supervisor(Node):
         vx = msg.twist.twist.linear.x
         vy = msg.twist.twist.linear.y
         self.speed = math.hypot(vx, vy)
+        self.yaw_rate = msg.twist.twist.angular.z
+        self._ekf_wz_ema = 0.9 * self._ekf_wz_ema + 0.1 * self.yaw_rate
+        self._ekf_win.append((now, self.yaw_rate))
         now = rclpy.time.Time.from_msg(msg.header.stamp).nanoseconds / 1e9
         if self._last_odom is not None:
             px, py, pt, pv = self._last_odom
