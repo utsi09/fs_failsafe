@@ -592,20 +592,23 @@ class AutowareE2EAgent(TUMROSBaseAgent):
             try:
                 world = CarlaDataProvider.get_world()
                 ego = CarlaDataProvider.get_hero_actor()
-                if self._cfl_lead is None and ego is not None and fault_elapsed >= 0.0:
+                # JIT 스폰: 제동 2초 전, 에고 전방 20m, 에고 속도 매칭
+                # (조기 스폰 + autopilot은 90m 도주 실측 -> 폐기)
+                if (self._cfl_lead is None and ego is not None
+                        and fault_elapsed >= spec[0] - 2.0):
                     tf = ego.get_transform(); fwd = tf.get_forward_vector()
-                    sp = carla.Transform(
-                        carla.Location(tf.location.x + fwd.x * 22.0,
-                                       tf.location.y + fwd.y * 22.0,
-                                       tf.location.z + 0.3), tf.rotation)
-                    bp = world.get_blueprint_library().filter("vehicle.audi.tt")[0]
-                    self._cfl_lead = world.try_spawn_actor(bp, sp)
-                    if self._cfl_lead is not None:
-                        self._cfl_lead.set_autopilot(True, CarlaDataProvider.get_traffic_manager_port())
-                        tm = CarlaDataProvider.get_client().get_trafficmanager(
-                            CarlaDataProvider.get_traffic_manager_port())
-                        tm.vehicle_percentage_speed_difference(self._cfl_lead, 20.0)
-                        print("[FAULT INJECTION] cfl2 lead spawned 22m ahead")
+                    for ahead in (20.0, 26.0, 32.0):
+                        sp = carla.Transform(
+                            carla.Location(tf.location.x + fwd.x * ahead,
+                                           tf.location.y + fwd.y * ahead,
+                                           tf.location.z + 0.5), tf.rotation)
+                        bp = world.get_blueprint_library().filter("vehicle.audi.tt")[0]
+                        self._cfl_lead = world.try_spawn_actor(bp, sp)
+                        if self._cfl_lead is not None:
+                            ev = ego.get_velocity()
+                            self._cfl_lead.set_target_velocity(ev)
+                            print(f"[FAULT INJECTION] cfl2 lead JIT-spawn {ahead:.0f}m ahead, v-matched")
+                            break
                 if (self._cfl_lead is not None and not self._cfl_braked
                         and fault_elapsed >= spec[0]):
                     self._cfl_lead.set_autopilot(False)
@@ -620,7 +623,10 @@ class AutowareE2EAgent(TUMROSBaseAgent):
                     ev = ego.get_velocity(); lv = self._cfl_lead.get_velocity()
                     closing = ((ev.x-lv.x)**2+(ev.y-lv.y)**2)**0.5
                     ttc = gap / closing if closing > 0.5 else 99.0
-                    if ttc < 0.9:
+                    if self._counter % 10 == 0:
+                        print(f"[TTCDBG] gap={gap:.1f} closing={closing:.2f} ttc={ttc:.2f}")
+                    # 0.9->1.8 상향에도 불발: 에고 AEB가 더 빨랐음. 계측 후 재결정
+                    if ttc < 1.8:
                         for actor in world.get_actors().filter("sensor.camera.rgb"):
                             if actor.parent is not None and actor.parent.id == ego.id:
                                 actor.destroy()
@@ -637,20 +643,23 @@ class AutowareE2EAgent(TUMROSBaseAgent):
             try:
                 world = CarlaDataProvider.get_world()
                 ego = CarlaDataProvider.get_hero_actor()
-                if self._cfl_lead is None and ego is not None and fault_elapsed >= 0.0:
+                # JIT 스폰: 제동 2초 전, 에고 전방 20m, 에고 속도 매칭
+                # (조기 스폰 + autopilot은 90m 도주 실측 -> 폐기)
+                if (self._cfl_lead is None and ego is not None
+                        and fault_elapsed >= spec[0] - 2.0):
                     tf = ego.get_transform(); fwd = tf.get_forward_vector()
-                    sp = carla.Transform(
-                        carla.Location(tf.location.x + fwd.x * 22.0,
-                                       tf.location.y + fwd.y * 22.0,
-                                       tf.location.z + 0.3), tf.rotation)
-                    bp = world.get_blueprint_library().filter("vehicle.audi.tt")[0]
-                    self._cfl_lead = world.try_spawn_actor(bp, sp)
-                    if self._cfl_lead is not None:
-                        self._cfl_lead.set_autopilot(True, CarlaDataProvider.get_traffic_manager_port())
-                        tm = CarlaDataProvider.get_client().get_trafficmanager(
-                            CarlaDataProvider.get_traffic_manager_port())
-                        tm.vehicle_percentage_speed_difference(self._cfl_lead, 20.0)
-                        print("[FAULT INJECTION] lfl2 lead spawned 22m ahead")
+                    for ahead in (20.0, 26.0, 32.0):
+                        sp = carla.Transform(
+                            carla.Location(tf.location.x + fwd.x * ahead,
+                                           tf.location.y + fwd.y * ahead,
+                                           tf.location.z + 0.5), tf.rotation)
+                        bp = world.get_blueprint_library().filter("vehicle.audi.tt")[0]
+                        self._cfl_lead = world.try_spawn_actor(bp, sp)
+                        if self._cfl_lead is not None:
+                            ev = ego.get_velocity()
+                            self._cfl_lead.set_target_velocity(ev)
+                            print(f"[FAULT INJECTION] lfl2 lead JIT-spawn {ahead:.0f}m ahead, v-matched")
+                            break
                 if (self._cfl_lead is not None and not self._cfl_braked
                         and fault_elapsed >= spec[0]):
                     self._cfl_lead.set_autopilot(False)
@@ -665,7 +674,7 @@ class AutowareE2EAgent(TUMROSBaseAgent):
                     ev = ego.get_velocity(); lv = self._cfl_lead.get_velocity()
                     closing = ((ev.x-lv.x)**2+(ev.y-lv.y)**2)**0.5
                     ttc = gap / closing if closing > 0.5 else 99.0
-                    if ttc < 1.4:
+                    if ttc < 1.8:
                         for actor in world.get_actors().filter("sensor.lidar.ray_cast"):
                             if (actor.parent is not None and actor.parent.id == ego.id
                                     and "front" in (actor.attributes.get("role_name","")

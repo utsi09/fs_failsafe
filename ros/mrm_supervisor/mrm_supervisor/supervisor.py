@@ -310,7 +310,9 @@ class Supervisor(Node):
         self.route_state = msg.state
 
     def _meas_pose_cb(self, msg):
-        self._meas_last_recv = time.monotonic()
+        # 시뮬 스탬프 기준(벽시계는 시뮬 감속 시 정상 공백을 침묵으로 오인
+        # — nf 4/49 오탐 실측, v2.1 수정)
+        self._meas_last_recv = rclpy.time.Time.from_msg(msg.header.stamp).nanoseconds / 1e9
         if self.pose is None:
             return
         # residual between the raw localization measurement and the EKF pose.
@@ -336,6 +338,7 @@ class Supervisor(Node):
         vx = msg.twist.twist.linear.x
         vy = msg.twist.twist.linear.y
         self.speed = math.hypot(vx, vy)
+        self._sim_now = rclpy.time.Time.from_msg(msg.header.stamp).nanoseconds / 1e9
         self.yaw_rate = msg.twist.twist.angular.z
         self._ekf_wz_ema = 0.9 * self._ekf_wz_ema + 0.1 * self.yaw_rate
         # 'now'는 이 함수 아래쪽에서 정의되므로 여기서 쓰면 UnboundLocalError
@@ -380,8 +383,9 @@ class Supervisor(Node):
         # 마지막(건강한) 값에 얼어붙는다 — gb 블랙아웃 미감지의 원인(v2 실측).
         # 주행 중 1초 이상 무수신이면 잔차 신뢰를 지수 감쇠시킨다.
         if (self._armed and self.speed > 1.0
-                and self._meas_last_recv is not None):
-            _stale = time.monotonic() - self._meas_last_recv
+                and self._meas_last_recv is not None
+                and getattr(self, "_sim_now", None) is not None):
+            _stale = self._sim_now - self._meas_last_recv
             if _stale > 1.0:
                 self.loc_meas_score = min(self.loc_meas_score,
                                           math.exp(-(_stale - 1.0) / 0.8))
