@@ -208,6 +208,17 @@ class AutowareE2EAgent(TUMROSBaseAgent):
             self.ros_node.declare_parameter("rain", os.environ.get("rain", ""))
             # gb=<t>[:<dur_s>]: GNSS blackout (publish gated in this agent)
             self.ros_node.declare_parameter("gb", os.environ.get("gb", ""))
+            # cfl=<t>: 근접 TTC ablation용 복합 고장 — t초에 선행차 급제동,
+            # t+0.8초에 카메라 파괴. TTC가 감지예산(850ms) 아래로 붕괴하는
+            # 순간의 침묵 고장 감지를 고정/동적 데드라인으로 비교한다.
+            self.ros_node.declare_parameter("cfl", os.environ.get("cfl", ""))
+            # cfl2=<t>: cfl 개선판 — 카메라 파괴를 고정 지연이 아니라
+            # "실측 TTC < 0.9s" 순간에 트리거 (동적 감지예산 이득 분리용)
+            self.ros_node.declare_parameter("cfl2", os.environ.get("cfl2", ""))
+            # lfl2=<t>: 선행차 급제동 + TTC<1.4s 순간 "전방 라이다" 파괴.
+            # 장애물 추적이 사라져 감지->DEFER 제동이 유일한 브레이크가 되는
+            # 칼날 시나리오 — 고정/동적 감지예산의 결과(충돌 여부) 차이 시험
+            self.ros_node.declare_parameter("lfl2", os.environ.get("lfl2", ""))
             # tail=<gap_m>: guarantee an NPC tailing the ego at <gap_m> meters
             # (background traffic spawns mostly ahead — rear-end pressure for
             # in-lane MRM stops needs an explicit chaser)
@@ -227,6 +238,9 @@ class AutowareE2EAgent(TUMROSBaseAgent):
         self._rain_applied = False
         self._gnss_blackout = False
         self._gb_bridge_sent = False
+        self._cfl_lead = None       # 선행 NPC 액터
+        self._cfl_braked = False
+        self._cfl_cam_killed = False
 
         # V2X sens gt traffic light states
         # Either the camera image or the v2x need to be set true
@@ -531,6 +545,137 @@ class AutowareE2EAgent(TUMROSBaseAgent):
                 print(f"[FAULT INJECTION] bridge gnss_mute={self._gnss_blackout}")
             except Exception as e:
                 print("[FAULT INJECTION] gnss_mute set failed:", e)
+
+        # cfl: 선행차 스폰(타이머 무장 직후) -> t초 급제동 -> t+0.8s 카메라 파괴
+        spec = self._parse_fault(self.ros_node.get_parameter("cfl").value, 0.0)
+        if spec:
+            try:
+                world = CarlaDataProvider.get_world()
+                ego = CarlaDataProvider.get_hero_actor()
+                if self._cfl_lead is None and ego is not None and fault_elapsed >= 0.0:
+                    tf = ego.get_transform()
+                    fwd = tf.get_forward_vector()
+                    sp = carla.Transform(
+                        carla.Location(tf.location.x + fwd.x * 22.0,
+                                       tf.location.y + fwd.y * 22.0,
+                                       tf.location.z + 0.3), tf.rotation)
+                    bp = world.get_blueprint_library().filter("vehicle.audi.tt")[0]
+                    self._cfl_lead = world.try_spawn_actor(bp, sp)
+                    if self._cfl_lead is not None:
+                        self._cfl_lead.set_autopilot(True, CarlaDataProvider.get_traffic_manager_port())
+                        tm = CarlaDataProvider.get_client().get_trafficmanager(
+                            CarlaDataProvider.get_traffic_manager_port())
+                        tm.vehicle_percentage_speed_difference(self._cfl_lead, 20.0)
+                        print("[FAULT INJECTION] cfl lead spawned 22m ahead")
+                if (self._cfl_lead is not None and not self._cfl_braked
+                        and fault_elapsed >= spec[0]):
+                    self._cfl_lead.set_autopilot(False)
+                    self._cfl_lead.apply_control(
+                        carla.VehicleControl(throttle=0.0, brake=1.0))
+                    self._cfl_braked = True
+                    print(f"[FAULT INJECTION] cfl lead HARD BRAKE at t+{spec[0]:.0f}s")
+                if (self._cfl_braked and not self._cfl_cam_killed
+                        and fault_elapsed >= spec[0] + 0.8):
+                    for actor in world.get_actors().filter("sensor.camera.rgb"):
+                        if actor.parent is not None and actor.parent.id == ego.id:
+                            actor.destroy()
+                    self._cfl_cam_killed = True
+                    self._camera_killed = True
+                    print(f"[FAULT INJECTION] cfl camera destroyed at t+{spec[0]+0.8:.1f}s (TTC collapsing)")
+            except Exception as e:
+                print("[FAULT INJECTION] cfl failed:", e)
+
+        # cfl2: 선행차 급제동 -> 에이전트가 차간/접근속도로 TTC 직접 계산
+        # -> TTC<0.9s 순간 카메라 파괴 (주입 시점의 TTC를 통제)
+        spec = self._parse_fault(self.ros_node.get_parameter("cfl2").value, 0.0)
+        if spec:
+            try:
+                world = CarlaDataProvider.get_world()
+                ego = CarlaDataProvider.get_hero_actor()
+                if self._cfl_lead is None and ego is not None and fault_elapsed >= 0.0:
+                    tf = ego.get_transform(); fwd = tf.get_forward_vector()
+                    sp = carla.Transform(
+                        carla.Location(tf.location.x + fwd.x * 22.0,
+                                       tf.location.y + fwd.y * 22.0,
+                                       tf.location.z + 0.3), tf.rotation)
+                    bp = world.get_blueprint_library().filter("vehicle.audi.tt")[0]
+                    self._cfl_lead = world.try_spawn_actor(bp, sp)
+                    if self._cfl_lead is not None:
+                        self._cfl_lead.set_autopilot(True, CarlaDataProvider.get_traffic_manager_port())
+                        tm = CarlaDataProvider.get_client().get_trafficmanager(
+                            CarlaDataProvider.get_traffic_manager_port())
+                        tm.vehicle_percentage_speed_difference(self._cfl_lead, 20.0)
+                        print("[FAULT INJECTION] cfl2 lead spawned 22m ahead")
+                if (self._cfl_lead is not None and not self._cfl_braked
+                        and fault_elapsed >= spec[0]):
+                    self._cfl_lead.set_autopilot(False)
+                    self._cfl_lead.apply_control(
+                        carla.VehicleControl(throttle=0.0, brake=1.0))
+                    self._cfl_braked = True
+                    print(f"[FAULT INJECTION] cfl2 lead HARD BRAKE at t+{spec[0]:.0f}s")
+                if (self._cfl_braked and not self._cfl_cam_killed
+                        and ego is not None and self._cfl_lead is not None):
+                    el = ego.get_location(); ll = self._cfl_lead.get_location()
+                    gap = ((el.x-ll.x)**2 + (el.y-ll.y)**2) ** 0.5 - 4.5
+                    ev = ego.get_velocity(); lv = self._cfl_lead.get_velocity()
+                    closing = ((ev.x-lv.x)**2+(ev.y-lv.y)**2)**0.5
+                    ttc = gap / closing if closing > 0.5 else 99.0
+                    if ttc < 0.9:
+                        for actor in world.get_actors().filter("sensor.camera.rgb"):
+                            if actor.parent is not None and actor.parent.id == ego.id:
+                                actor.destroy()
+                        self._cfl_cam_killed = True
+                        self._camera_killed = True
+                        print(f"[FAULT INJECTION] cfl2 camera destroyed at TTC={ttc:.2f}s gap={gap:.1f}m")
+            except Exception as e:
+                print("[FAULT INJECTION] cfl2 failed:", e)
+
+        # lfl2: 선행차 급제동 -> 에이전트가 차간/접근속도로 TTC 직접 계산
+        # -> TTC<0.9s 순간 카메라 파괴 (주입 시점의 TTC를 통제)
+        spec = self._parse_fault(self.ros_node.get_parameter("lfl2").value, 0.0)
+        if spec:
+            try:
+                world = CarlaDataProvider.get_world()
+                ego = CarlaDataProvider.get_hero_actor()
+                if self._cfl_lead is None and ego is not None and fault_elapsed >= 0.0:
+                    tf = ego.get_transform(); fwd = tf.get_forward_vector()
+                    sp = carla.Transform(
+                        carla.Location(tf.location.x + fwd.x * 22.0,
+                                       tf.location.y + fwd.y * 22.0,
+                                       tf.location.z + 0.3), tf.rotation)
+                    bp = world.get_blueprint_library().filter("vehicle.audi.tt")[0]
+                    self._cfl_lead = world.try_spawn_actor(bp, sp)
+                    if self._cfl_lead is not None:
+                        self._cfl_lead.set_autopilot(True, CarlaDataProvider.get_traffic_manager_port())
+                        tm = CarlaDataProvider.get_client().get_trafficmanager(
+                            CarlaDataProvider.get_traffic_manager_port())
+                        tm.vehicle_percentage_speed_difference(self._cfl_lead, 20.0)
+                        print("[FAULT INJECTION] lfl2 lead spawned 22m ahead")
+                if (self._cfl_lead is not None and not self._cfl_braked
+                        and fault_elapsed >= spec[0]):
+                    self._cfl_lead.set_autopilot(False)
+                    self._cfl_lead.apply_control(
+                        carla.VehicleControl(throttle=0.0, brake=1.0))
+                    self._cfl_braked = True
+                    print(f"[FAULT INJECTION] lfl2 lead HARD BRAKE at t+{spec[0]:.0f}s")
+                if (self._cfl_braked and not self._cfl_cam_killed
+                        and ego is not None and self._cfl_lead is not None):
+                    el = ego.get_location(); ll = self._cfl_lead.get_location()
+                    gap = ((el.x-ll.x)**2 + (el.y-ll.y)**2) ** 0.5 - 4.5
+                    ev = ego.get_velocity(); lv = self._cfl_lead.get_velocity()
+                    closing = ((ev.x-lv.x)**2+(ev.y-lv.y)**2)**0.5
+                    ttc = gap / closing if closing > 0.5 else 99.0
+                    if ttc < 1.4:
+                        for actor in world.get_actors().filter("sensor.lidar.ray_cast"):
+                            if (actor.parent is not None and actor.parent.id == ego.id
+                                    and "front" in (actor.attributes.get("role_name","")
+                                                    + actor.attributes.get("ros_name",""))):
+                                actor.destroy()
+                        self._cfl_cam_killed = True
+                        self._lidar_killed = True
+                        print(f"[FAULT INJECTION] lfl2 FRONT LIDAR destroyed at TTC={ttc:.2f}s gap={gap:.1f}m")
+            except Exception as e:
+                print("[FAULT INJECTION] lfl2 failed:", e)
 
         # single latched "fault is now live" signal for the experiment judge
         if not self._fault_announced and (

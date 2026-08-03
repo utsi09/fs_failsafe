@@ -90,8 +90,8 @@ SEV_LEVELS = ["mid", "high"]
 FAULT_KINDS = ["ln", "cn", "imn", "gn", "cf", "lf", "nf"]
 # v2 추가 고장: imb=자이로 바이어스, rain=폭우 프리셋, gb=GNSS 블랙아웃.
 # 기본 매트릭스에는 넣지 않고 --fault 로 명시 선택했을 때만 실행된다.
-EXTRA_FAULT_KINDS = ["imb", "rain", "gb"]
-NO_SEVERITY = {"cf", "lf", "nf", "rain", "gb"}  # no severity dimension (nf: no trigger either)
+EXTRA_FAULT_KINDS = ["imb", "rain", "gb", "cfl", "mix", "cfl2", "lfl2"]
+NO_SEVERITY = {"cf", "lf", "nf", "rain", "gb", "cfl", "mix", "cfl2", "lfl2"}  # no severity dimension (nf: no trigger either)
 # fault time is a RANDOM COVARIATE, not a matrix dimension: fixed trigger
 # times pinned the fault to the same spots so the supervisor always picked
 # the same shoulder. Per-case t is drawn deterministically from the cell key
@@ -153,6 +153,9 @@ def build_cases(args):
 def fault_args(case, dg="1"):
     if case["fault"] == "nf":
         args = ""                                   # control arm: no fault
+    elif case["fault"] == "mix":
+        # 복합 고장: 라이다+카메라 동시 노이즈(악천후 유사) — min() 합성 검증
+        args = f"ln={case['t']}:0.3 cn={case['t']}:15.0"
     elif case["fault"] in NO_SEVERITY:
         args = f"{case['fault']}={case['t']}"
     else:
@@ -785,7 +788,10 @@ def archive_case_logs(idx, case, dry):
         return
     import gzip
     import shutil
-    dst = OUT_DIR / "case_logs" / f"{idx}_{case['method']}_{case['fault']}"
+    # 실행(run)마다 폴더 구분 — idx만 쓰면 다른 런의 같은 idx가 덮어씀
+    # (cfl ablation에서 fixed 런 로그가 dynamic 런에 덮인 사고, 0803)
+    run_tag = datetime.now().strftime("%m%d_%H%M")[:9]
+    dst = OUT_DIR / "case_logs" / f"{run_tag}_{idx}_{case['method']}_{case['fault']}"
     for name in ("cdr", "supervisor"):
         src = OUT_DIR / f"{name}.log"
         try:
