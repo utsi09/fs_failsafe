@@ -1,0 +1,2 @@
+idx,method,fault,severity,trigger_s,npc,rep,outcome,final_state,aw_mrm,stop_x,stop_y,time_to_stop_s,collisions,collision_types,wall_s
+0,ours,gn,high,20,def,0,INTERRUPTED,NORMAL,EMERGENCY_STOP,-126.0,97.6,,,,208.4

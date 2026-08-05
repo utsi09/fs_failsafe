@@ -26,5 +26,6 @@ private:
 
     double trusted_ttc_ = 1000.0;   // last TTC measured while sources healthy
     bool was_unhealthy_ = false;
+    bool hold_expired_ = false;     // 감쇠 홀드가 0까지 떨어져 해제되었는지
     std::chrono::steady_clock::time_point unhealthy_since_;
 };

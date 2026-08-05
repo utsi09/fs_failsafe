@@ -64,6 +64,10 @@ JUNCTION_STUCK_S = 100.0
 # red-light wait en route to the shoulder can exceed 60 s — give MRM_MOVE
 # three full cycles before calling it stuck
 MRM_MOVE_STUCK_S = 150.0
+# --mrm-off (FTTI 도출 모드): 고장 후 이 시간 동안 무사고면 SURVIVED,
+# 고장 이후 시작된 정지가 이 시간 이상 지속되면 HAZARD_STOPPED
+HAZARD_SURVIVE_S = 360.0
+HAZARD_STOP_S = 60.0
 # fresh CARLA per case: the server degrades progressively (boot 57s -> 150s+
 # by case 3-4, sim-rate drop re-flaps the 3 s diag timeouts and poisons
 # verdicts). ~1 min/restart is cheaper than a wasted 7-min case, and a fresh
@@ -78,12 +82,16 @@ SEVERITY = {
     "cn":  {"mid": 15.0, "high": 30.0},
     "imn": {"mid": 0.05, "high": 0.15},
     "gn":  {"mid": 1.0,  "high": 2.5},
+    "imb": {"mid": 0.3,  "high": 1.0},   # v2: 자이로 바이어스 [rad/s]
 }
 SEV_LEVELS = ["mid", "high"]
 # ln: BOTH lidars noise; cn: camera noise; imn: IMU noise; gn: GNSS/EKF pose
 # noise; cf: camera destroyed; lf: front lidar destroyed; nf: no-fault control
 FAULT_KINDS = ["ln", "cn", "imn", "gn", "cf", "lf", "nf"]
-NO_SEVERITY = {"cf", "lf", "nf"}  # no severity dimension (nf: no trigger either)
+# v2 추가 고장: imb=자이로 바이어스, rain=폭우 프리셋, gb=GNSS 블랙아웃.
+# 기본 매트릭스에는 넣지 않고 --fault 로 명시 선택했을 때만 실행된다.
+EXTRA_FAULT_KINDS = ["imb", "rain", "gb", "cfl", "mix", "cfl2", "lfl2"]
+NO_SEVERITY = {"cf", "lf", "nf", "rain", "gb", "cfl", "mix", "cfl2", "lfl2"}  # no severity dimension (nf: no trigger either)
 # fault time is a RANDOM COVARIATE, not a matrix dimension: fixed trigger
 # times pinned the fault to the same spots so the supervisor always picked
 # the same shoulder. Per-case t is drawn deterministically from the cell key
@@ -96,6 +104,17 @@ REPEATS = 15
 
 def build_cases(args):
     methods = METHODS if args.method == "both" else [args.method]
+    if args.retry_failed:
+        # v2: 기존 결과 CSV에서 CARLA_DIED/SETUP_FAIL 케이스만 같은
+        # (fault,sev,npc,rep,method,t) 조건으로 다시 실행
+        cases = []
+        with open(args.retry_failed, newline="") as f:
+            for row in csv.DictReader(f):
+                if row.get("outcome") in ("CARLA_DIED", "SETUP_FAIL"):
+                    cases.append({"method": row["method"], "fault": row["fault"],
+                                  "sev": row["severity"], "t": int(row["trigger_s"]),
+                                  "npc": row["npc"], "rep": int(row["rep"])})
+        return cases
     if args.smoke:
         return [{"method": m,
                  "fault": args.fault or "ln",
@@ -104,8 +123,10 @@ def build_cases(args):
                  "npc": args.npc or "def", "rep": 0} for m in methods]
     import random
     cases = []
+    # v2 고장은 --fault 로 명시했을 때만 매트릭스에 합류
+    fault_kinds = FAULT_KINDS + [f for f in EXTRA_FAULT_KINDS if f == args.fault]
     for fault, sev, npc, rep, method in itertools.product(
-            FAULT_KINDS, SEV_LEVELS, NPC_STYLES,
+            fault_kinds, SEV_LEVELS, NPC_STYLES,
             range(args.reps if args.reps is not None else REPEATS), methods):
         if fault in NO_SEVERITY and sev != "mid":
             continue  # destruction faults have no severity dimension
@@ -132,6 +153,9 @@ def build_cases(args):
 def fault_args(case, dg="1"):
     if case["fault"] == "nf":
         args = ""                                   # control arm: no fault
+    elif case["fault"] == "mix":
+        # 복합 고장: 라이다+카메라 동시 노이즈(악천후 유사) — min() 합성 검증
+        args = f"ln={case['t']}:0.3 cn={case['t']}:15.0"
     elif case["fault"] in NO_SEVERITY:
         args = f"{case['fault']}={case['t']}"
     else:
@@ -334,6 +358,25 @@ def autoware_ready(dry, timeout=AUTOWARE_READY_TIMEOUT):
     return False
 
 
+def capture_stall_factor():
+    """STUCK/DEFER 원인 추적: 확정 직전 velocity factor의 behavior를 1회 캡처."""
+    try:
+        r = subprocess.run(
+            ["bash", "-lc",
+             "timeout 8 ros2 topic echo --once /api/planning/velocity_factors"],
+            capture_output=True, text=True, timeout=12)
+        vals = []
+        for line in r.stdout.splitlines():
+            s = line.strip()
+            if s.startswith("behavior:"):
+                v = s.split(":", 1)[1].strip().strip("'\"")
+                if v and v not in vals:
+                    vals.append(v)
+        return "+".join(vals)
+    except Exception:
+        return ""   # 실패 시 빈칸 (케이스 진행에는 영향 없음)
+
+
 # ---------------------------------------------------------------- judge
 class Judge:
     """Watches supervisor state + ego odometry, decides how the case ended."""
@@ -367,6 +410,7 @@ class Judge:
         self._obs_start = None         # traffic-flow observation window
         self._obs_samples = []
         self.traffic = ""              # cleared / blocked after the stop
+        self.stall_factor = ""         # STUCK/DEFER 시점의 정지 요인 (v2)
 
         self.node.create_subscription(
             String, "/mrm_supervisor/state", self._state_cb,
@@ -506,6 +550,9 @@ class Judge:
                 if self._obs_start is None:
                     self._obs_start = now
                     self._obs_samples = []
+                    if verdict == "DEFER_STOPPED":
+                        # 확정 직전 1회: 무엇이 차를 세우고 있는지 기록 (v2)
+                        self.stall_factor = capture_stall_factor()
                     print(f"[judge] {verdict} — observing traffic flow 10 s")
                 lb_dead = lb_proc is not None and lb_proc.poll() is not None
                 if now - self._obs_start >= 10.0 or lb_dead:
@@ -534,14 +581,77 @@ class Judge:
                 return "SCENARIO_ENDED", self._detail()
             if (self.moved and self.state in ("", "NORMAL")
                     and stationary_for > JUNCTION_STUCK_S):
+                self.stall_factor = capture_stall_factor()   # 확정 직전 1회 (v2)
                 return "STUCK_AT_JUNCTION", self._detail()
             if self.state.startswith("MRM_MOVE") and stopped_for > MRM_MOVE_STUCK_S:
+                self.stall_factor = capture_stall_factor()   # 확정 직전 1회 (v2)
                 return "STUCK_IN_MRM_MOVE", self._detail()
             if elapsed > CASE_TIMEOUT_S:
                 return "TIMEOUT", self._detail()
             if not carla_alive():
                 return "CARLA_DIED", self._detail()
             time.sleep(1.0)
+
+    def outcome_hazard(self, case_t0, lb_proc):
+        """--mrm-off (FTTI 도출): 개입 없이 고장 -> 위험 사건까지 관찰만 한다.
+
+        위험 사건: 충돌(HAZARD_COLLISION), 차로 이탈(HAZARD_LANE_DEPART),
+        지속 정지(HAZARD_STOPPED). 고장 후 6분 무사고면 HAZARD_SURVIVED."""
+        last_beat = 0.0
+        while True:
+            now = time.time()
+            elapsed = now - case_t0
+            if now - last_beat > 30.0:
+                last_beat = now
+                print(f"[judge] t+{elapsed:.0f}s (hazard watch) "
+                      f"speed={self.speed if self.speed is not None else 'no-odom'} "
+                      f"fault={'yes' if self.fault_time else 'no'}")
+            # 고장 이후에만 leaderboard 로그의 충돌/이탈 이벤트를 인정
+            # (시동 단계 이벤트 오염 방지)
+            if self.fault_time is not None:
+                hz = self._leaderboard_hazard()
+                if hz:
+                    return hz, self._detail_hazard(now)
+                if (self.stationary_since is not None
+                        and self.stationary_since >= self.fault_time
+                        and now - self.stationary_since > HAZARD_STOP_S):
+                    # 정지 시작 시점을 사건 시각으로 기록
+                    return "HAZARD_STOPPED", self._detail_hazard(self.stationary_since)
+                if now - self.fault_time > HAZARD_SURVIVE_S:
+                    return "HAZARD_SURVIVED", self._detail_hazard(None)
+            if lb_proc is not None and lb_proc.poll() is not None:
+                # 시나리오가 먼저 끝났으면 결과 json으로 충돌 여부 최종 확인
+                n_coll, _types = parse_infractions()
+                if isinstance(n_coll, int) and n_coll > 0:
+                    return "HAZARD_COLLISION", self._detail_hazard(now)
+                return "SCENARIO_ENDED", self._detail_hazard(None)
+            if elapsed > CASE_TIMEOUT_S + HAZARD_SURVIVE_S:
+                return "TIMEOUT", self._detail_hazard(None)
+            if not carla_alive():
+                return "CARLA_DIED", self._detail_hazard(None)
+            time.sleep(1.0)
+
+    def _leaderboard_hazard(self):
+        # leaderboard 로그를 훑어 충돌/차로이탈 이벤트를 즉시 감지
+        try:
+            log = (OUT_DIR / "leaderboard.log").read_text(errors="ignore")
+        except OSError:
+            return None
+        low = log.lower()
+        # "collided": 실제 사건 문구만 매칭 ("collision"은 종료 요약표에도 등장)
+        if "collided" in low:
+            return "HAZARD_COLLISION"
+        if "outside its route lanes" in low or "lane invasion" in low:
+            return "HAZARD_LANE_DEPART"
+        return None
+
+    def _detail_hazard(self, hz_time):
+        # 고장 -> 위험 사건까지 걸린 시간을 t_hazard_s 로 덧붙인다
+        d = self._detail()
+        d["t_hazard_s"] = (round(hz_time - self.fault_time, 1)
+                           if hz_time is not None and self.fault_time is not None
+                           else "")
+        return d
 
     def _target(self):
         # state strings may carry the target in the future; fall back to state
@@ -568,6 +678,7 @@ class Judge:
                 "deg_dist_m": round(self.deg_dist, 1) if self.fault_time else "",
                 "min_gap_m": round(self.min_gap, 1) if self.min_gap is not None else "",
                 "traffic": self.traffic,
+                "stall_factor": self.stall_factor,
                 "aw_mrm": "+".join(self.aw_behaviors)}
 
     def reset(self):
@@ -588,6 +699,7 @@ class Judge:
         self._obs_start = None
         self._obs_samples = []
         self.traffic = ""
+        self.stall_factor = ""
 
     def shutdown(self):
         self._spin_alive = False
@@ -668,6 +780,32 @@ def parse_infractions():
         return "", ""
 
 
+def archive_case_logs(idx, case, dry):
+    """케이스 종료 시 cdr/supervisor 로그를 삭제 대신 gzip으로 보관 (v2).
+
+    results/case_logs/<idx>_<method>_<fault>/ 로 이동. --no-log-archive 로 끔."""
+    if dry:
+        return
+    import gzip
+    import shutil
+    # 실행(run)마다 폴더 구분 — idx만 쓰면 다른 런의 같은 idx가 덮어씀
+    # (cfl ablation에서 fixed 런 로그가 dynamic 런에 덮인 사고, 0803)
+    run_tag = datetime.now().strftime("%m%d_%H%M")[:9]
+    dst = OUT_DIR / "case_logs" / f"{run_tag}_{idx}_{case['method']}_{case['fault']}"
+    for name in ("cdr", "supervisor"):
+        src = OUT_DIR / f"{name}.log"
+        try:
+            if not src.exists():
+                continue
+            dst.mkdir(parents=True, exist_ok=True)
+            with open(src, "rb") as fin, \
+                    gzip.open(dst / f"{name}.log.gz", "wb") as fout:
+                shutil.copyfileobj(fin, fout)
+            src.unlink()
+        except OSError:
+            pass   # 보관 실패가 캠페인을 멈추게 하지 않는다
+
+
 # ---------------------------------------------------------------- main loop
 def run(args):
     os.environ["ROS_DOMAIN_ID"] = "0"   # judge + ros2 CLI polling
@@ -683,13 +821,22 @@ def run(args):
     procs = Procs(args.dry)
     judge = None if args.dry else Judge()
 
+    # v2: 신선도 데드라인 / 동적 FTTI ablation 을 cdr launch 인자로 전달
+    # (파라미터 수용은 cdr_monitor 쪽 몫; 러너는 전달만 한다)
+    cdr_cmd = CDR_CMD
+    if args.fresh_ms is not None:
+        cdr_cmd += f" fresh_ms:={args.fresh_ms}"
+    if args.variant:
+        cdr_cmd += " ttc_dynamic:=" + ("true" if args.variant == "dynamic" else "false")
+
     with open(csv_path, "w", newline="") as f:
         wr = csv.writer(f)
         wr.writerow(["idx", "method", "fault", "severity", "trigger_s", "npc", "rep",
                      "outcome", "final_state", "aw_mrm", "stop_x", "stop_y",
                      "lane_overlap_m", "lane_block_pct",
                      "det_latency_s", "tts_fault_s", "deg_dist_m", "min_gap_m", "traffic",
-                     "time_to_stop_s", "collisions", "collision_types", "wall_s"])
+                     "time_to_stop_s", "collisions", "collision_types",
+                     "stall_factor", "t_hazard_s", "wall_s"])   # v2 열 2종
         interrupted = False
         for i, case in enumerate(cases):
             if interrupted:
@@ -721,9 +868,24 @@ def run(args):
                 # MRM and blocks engagement. Startup transients are safe now —
                 # cdr reports OK during sensor warmup and the supervisor stays
                 # disarmed until it has seen healthy scores once.
-                procs.host_bg(CDR_CMD, "cdr")
-                baseline = "true" if case["method"] == "baseline" else "false"
-                procs.host_bg(SUP_CMD.format(baseline=baseline), "supervisor")
+                if not args.mrm_off:
+                    procs.host_bg(cdr_cmd, "cdr")
+                    baseline = "true" if case["method"] == "baseline" else "false"
+                    procs.host_bg(SUP_CMD.format(baseline=baseline), "supervisor")
+                else:
+                    # --mrm-off 1차 배터리 실패 원인: cdr/supervisor를 아예 안
+                    # 띄우면 진단 그래프의 두 유닛이 STALE -> autonomous 잠금
+                    # -> 출발 불가. cdr은 정상 기동(점수만 낼 뿐 개입 없음),
+                    # supervisor 유닛은 더미 OK 발행으로 그래프만 만족시킨다.
+                    procs.host_bg(cdr_cmd, "cdr")
+                    procs.host_bg(
+                        "export ROS_DOMAIN_ID=0; "
+                        "export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp; "
+                        "export CYCLONEDDS_URI=/home/taewook/cyclone_localhost.xml; "
+                        "source /opt/ros/humble/setup.bash && "
+                        "python3 /home/taewook/autoware_carla_leaderboard/experiments/dummy_defer.py",
+                        "dummy_defer")
+                # --mrm-off: 모니터·MRM 개입 없이 고장 진행만 관찰 (FTTI 도출)
                 # per-unit graph levels — to identify which unit flaps the MRM
                 procs.host_bg(DUMP_CMD, "diag_dump")
                 lb = procs.docker_bg(LB_CONTAINER,
@@ -734,6 +896,8 @@ def run(args):
                     raise RuntimeError("ego odometry never appeared")
                 if args.dry:
                     outcome, detail = "DRY", {}
+                elif args.mrm_off:
+                    outcome, detail = judge.outcome_hazard(t0, lb)
                 else:
                     outcome, detail = judge.outcome(t0, lb)
             except KeyboardInterrupt:
@@ -743,6 +907,9 @@ def run(args):
                 outcome, detail = "SETUP_FAIL", {"final_state": str(e)[:60]}
             finally:
                 procs.kill_all()
+                # 로그 보관은 기본 켜짐; --mrm-off 땐 cdr/supervisor 자체가 없음
+                if not args.no_log_archive and not args.mrm_off:
+                    archive_case_logs(i, case, args.dry)
 
             wall = round(time.time() - t0, 1)
             n_coll, coll_types = parse_infractions()
@@ -756,7 +923,9 @@ def run(args):
                    detail.get("deg_dist_m", ""), detail.get("min_gap_m", ""),
                    detail.get("traffic", ""),
                    detail.get("time_to_stop_s", ""),
-                   n_coll, coll_types, wall]
+                   n_coll, coll_types,
+                   detail.get("stall_factor", ""), detail.get("t_hazard_s", ""),
+                   wall]
             wr.writerow(row)
             f.flush()
             print(f"[runner] result: {outcome} ({wall}s)")
@@ -772,8 +941,9 @@ if __name__ == "__main__":
     ap.add_argument("--dry", action="store_true", help="print commands, run nothing")
     ap.add_argument("--method", choices=["ours", "baseline", "both"], default="both",
                     help="which MRM method arm(s) to run")
-    ap.add_argument("--fault", choices=FAULT_KINDS,
-                    help="fault kind (smoke: sets it; full run: filters matrix)")
+    ap.add_argument("--fault", choices=FAULT_KINDS + EXTRA_FAULT_KINDS,
+                    help="fault kind (smoke: sets it; full run: filters matrix; "
+                         "imb/rain/gb are v2-only and run only when named here)")
     ap.add_argument("--sev", choices=SEV_LEVELS,
                     help="severity (smoke: sets it; full run: filters matrix)")
     ap.add_argument("--t", type=int,
@@ -789,5 +959,16 @@ if __name__ == "__main__":
                          'the tagged-shoulder corridor (center road west, then '
                          'north); "1" = route\'s own destination, '
                          '"x:y[:yaw_deg]" custom, "" full waypoints')
+    # ---------------- 재실험 v2 옵션 (기본값이면 v1과 동작 동일)
+    ap.add_argument("--fresh-ms", type=int, choices=[500, 850, 1000],
+                    help="cdr 신선도 데드라인 [ms] — cdr launch에 fresh_ms:= 전달")
+    ap.add_argument("--variant", choices=["fixed", "dynamic"],
+                    help="동적 FTTI ablation — cdr launch에 ttc_dynamic:= 전달")
+    ap.add_argument("--mrm-off", action="store_true",
+                    help="FTTI 도출 모드: 모니터/MRM 없이 고장->위험사건 시간 기록")
+    ap.add_argument("--retry-failed", metavar="CSV",
+                    help="기존 결과 CSV의 CARLA_DIED/SETUP_FAIL 케이스만 재실행")
+    ap.add_argument("--no-log-archive", action="store_true",
+                    help="케이스별 cdr/supervisor 로그 gzip 보관을 끈다")
     args = ap.parse_args()
     run(args)

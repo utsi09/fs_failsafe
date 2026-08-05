@@ -1,0 +1,6 @@
+idx,method,fault,severity,trigger_s,npc,rep,outcome,final_state,aw_mrm,stop_x,stop_y,lane_overlap_m,lane_block_pct,det_latency_s,tts_fault_s,deg_dist_m,min_gap_m,traffic,time_to_stop_s,collisions,collision_types,stall_factor,t_hazard_s,wall_s
+0,ours,cf,mid,21,agg,0,SCENARIO_ENDED,,EMERGENCY_STOP,27.9,-60.0,1.9,54.3,,,,,,,0,,,,198.6
+1,ours,cf,mid,13,agg,1,SCENARIO_ENDED,,EMERGENCY_STOP,27.9,-60.0,1.9,54.3,,,,,,,0,,,,198.5
+2,ours,cf,mid,30,agg,2,SCENARIO_ENDED,,EMERGENCY_STOP,27.9,-60.0,1.9,54.3,,,,,,,0,,,,197.5
+3,ours,cf,mid,38,agg,3,SCENARIO_ENDED,,EMERGENCY_STOP,27.9,-60.0,1.9,54.3,,,,,,,0,,,,196.5
+4,ours,cf,mid,32,agg,4,SCENARIO_ENDED,,EMERGENCY_STOP,27.9,-60.0,1.9,54.3,,,,,,,0,,,,198.7

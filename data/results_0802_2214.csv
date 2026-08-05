@@ -1,0 +1,11 @@
+idx,method,fault,severity,trigger_s,npc,rep,outcome,final_state,aw_mrm,stop_x,stop_y,lane_overlap_m,lane_block_pct,det_latency_s,tts_fault_s,deg_dist_m,min_gap_m,traffic,time_to_stop_s,collisions,collision_types,stall_factor,t_hazard_s,wall_s
+0,ours,gb,mid,20,agg,0,STUCK_AT_JUNCTION,NORMAL,EMERGENCY_STOP,-126.0,97.9,1.9,66.6,,72.6,263.1,4.2,,,,,goal-planner,,263.1
+1,baseline,gb,mid,20,agg,0,STUCK_AT_JUNCTION,NORMAL,EMERGENCY_STOP,-125.8,97.9,1.9,66.6,,72.4,262.2,2.4,,,,,goal-planner,,262.4
+2,ours,gb,mid,35,agg,1,STUCK_AT_JUNCTION,NORMAL,EMERGENCY_STOP,-126.2,97.9,1.9,66.6,,148.0,253.0,2.6,,,,,goal-planner,,350.0
+3,baseline,gb,mid,35,agg,1,STUCK_AT_JUNCTION,NORMAL,EMERGENCY_STOP,-126.3,97.9,1.9,66.6,,71.2,253.3,2.3,,,,,goal-planner,,274.7
+4,ours,gb,mid,17,agg,2,STUCK_AT_JUNCTION,NORMAL,EMERGENCY_STOP,-108.1,36.0,1.9,76.3,,43.6,163.2,4.6,,,,,,,229.8
+5,baseline,gb,mid,17,agg,2,STUCK_AT_JUNCTION,NORMAL,EMERGENCY_STOP,-107.4,36.0,1.9,76.3,,36.2,162.4,2.7,,,,,,,222.9
+6,ours,gb,mid,38,agg,3,STUCK_AT_JUNCTION,NORMAL,EMERGENCY_STOP,-125.6,97.9,1.9,66.6,,60.0,197.4,2.8,,,,,goal-planner,,263.9
+7,baseline,gb,mid,38,agg,3,STUCK_AT_JUNCTION,NORMAL,EMERGENCY_STOP,-102.7,34.8,1.9,54.3,,29.2,89.0,2.7,,,,,,,233.7
+8,ours,gb,mid,33,agg,4,STUCK_AT_JUNCTION,NORMAL,EMERGENCY_STOP,-125.5,97.9,1.9,66.6,,58.3,237.9,4.3,,,,,goal-planner,,258.8
+9,baseline,gb,mid,33,agg,4,STUCK_AT_JUNCTION,NORMAL,EMERGENCY_STOP,-107.3,36.0,1.9,76.3,,31.9,125.0,2.6,,,,,,,232.5

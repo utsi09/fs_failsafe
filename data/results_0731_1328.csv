@@ -1,0 +1,2 @@
+idx,method,fault,severity,trigger_s,npc,rep,outcome,final_state,aw_mrm,stop_x,stop_y,lane_overlap_m,lane_block_pct,det_latency_s,tts_fault_s,deg_dist_m,min_gap_m,time_to_stop_s,collisions,collision_types,wall_s
+0,ours,cn,mid,10,agg,0,AW_COMFORTABLE_STOP_DONE,MRM_DEFER,COMFORTABLE_STOP,-2.3,-32.8,0.0,0.0,3.5,7.3,22.8,3.4,,,,92.4

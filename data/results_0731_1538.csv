@@ -1,0 +1,6 @@
+idx,method,fault,severity,trigger_s,npc,rep,outcome,final_state,aw_mrm,stop_x,stop_y,lane_overlap_m,lane_block_pct,det_latency_s,tts_fault_s,deg_dist_m,min_gap_m,traffic,time_to_stop_s,collisions,collision_types,wall_s
+0,ours,ln,mid,20,def,0,STUCK_IN_MRM_MOVE,MRM_MOVE:shoulder_1002238,EMERGENCY_STOP,-2.1,8.3,1.9,59.9,1.1,128.6,29.4,0.1,,,,,412.2
+1,ours,cn,mid,25,def,0,SCENARIO_ENDED,NORMAL,EMERGENCY_STOP,27.9,-60.0,1.9,54.3,,,,,,,0,,259.2
+2,ours,imn,mid,25,def,0,STUCK_AT_JUNCTION,NORMAL,EMERGENCY_STOP,-125.4,98.0,1.9,66.6,,67.2,249.0,4.6,,,,,352.8
+3,ours,gn,mid,27,def,0,SETUP_FAIL,ego odometry never appeared,,,,,,,,,,,,,,240.5
+4,ours,cf,mid,24,def,0,INTERRUPTED,NORMAL,EMERGENCY_STOP,27.9,-60.0,1.9,54.3,,,,,,,,,227.6

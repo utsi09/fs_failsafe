@@ -1,0 +1,1 @@
+idx,method,fault,severity,trigger_s,npc,rep,outcome,final_state,aw_mrm,stop_x,stop_y,time_to_stop_s,collisions,collision_types,wall_s

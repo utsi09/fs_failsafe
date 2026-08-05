@@ -1,0 +1,6 @@
+idx,method,fault,severity,trigger_s,npc,rep,outcome,final_state,aw_mrm,stop_x,stop_y,lane_overlap_m,lane_block_pct,det_latency_s,tts_fault_s,deg_dist_m,min_gap_m,traffic,time_to_stop_s,collisions,collision_types,stall_factor,t_hazard_s,wall_s
+0,ours,ln,mid,12,agg,0,CARLA_DIED,NORMAL,,7.4,-59.2,1.9,54.3,,,,,,,,,,,73.0
+1,ours,ln,mid,10,agg,1,AW_COMFORTABLE_STOP_DONE,MRM_DEFER:shoulder_1002596,EMERGENCY_STOP+COMFORTABLE_STOP,-2.2,-38.5,1.9,54.3,1.0,42.5,19.6,0.3,,41.5,0,,,,256.6
+2,ours,ln,mid,27,agg,2,AW_EMERGENCY_STOP_DONE,MRM_DEFER:shoulder_1002445,EMERGENCY_STOP,-45.0,10.6,0.95,6.2,1.0,86.3,52.2,0.3,blocked,85.2,,,,,194.5
+3,ours,ln,mid,25,agg,3,AW_COMFORTABLE_STOP_DONE,MRM_DEFER:shoulder_1002450,EMERGENCY_STOP+COMFORTABLE_STOP,-59.4,5.3,0.95,18.7,1.1,211.5,66.7,0.2,,210.5,1,layout:1,,,405.4
+4,ours,ln,mid,28,agg,4,AW_EMERGENCY_STOP_DONE,MRM_MOVE:shoulder_1002500,EMERGENCY_STOP,-3.5,-52.0,1.63,46.7,1.1,-14.1,0.0,8.7,cleared,-15.3,,,,,96.7

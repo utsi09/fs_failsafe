@@ -1,0 +1,2 @@
+idx,method,fault,severity,trigger_s,npc,rep,outcome,final_state,aw_mrm,stop_x,stop_y,lane_overlap_m,lane_block_pct,det_latency_s,tts_fault_s,deg_dist_m,min_gap_m,time_to_stop_s,collisions,collision_types,wall_s
+0,ours,gn,high,10,def,0,SETUP_FAIL,ego odometry never appeared,,,,,,,,,,,,,151.4

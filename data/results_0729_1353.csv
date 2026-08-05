@@ -1,0 +1,2 @@
+idx,fault,severity,trigger_s,npc,rep,outcome,final_state,stop_x,stop_y,time_to_stop_s,collisions,wall_s
+0,ln,mid,40,def,0,DRY,,,,,,3.0

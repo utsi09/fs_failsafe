@@ -177,6 +177,10 @@ class AutowareE2EAgent(TUMROSBaseAgent):
         #   cf=20       destroy camera 20 s in (image freezes downstream)
         #   cn=20:15    respawn camera at 20 s with gaussian pixel noise (sigma 15 on 0-255)
         #   ln=20:0.1   respawn lidars at 20 s with CARLA-native noise_stddev=0.1 m
+        #   imb=20:0.02 constant gyro z (yaw-rate) bias of 0.02 rad/s from 20 s on
+        #   rain=20     switch the CARLA weather to a heavy downpour at 20 s
+        #   gb=20:30    GNSS blackout: stop the GNSS pose publish for 30 s
+        #               (duration omitted = blackout forever)
         # Runtime override:
         #   ros2 param set /autoware_e2e_node cf true
         #   ros2 param set /autoware_e2e_node cn "0:15"      (0 = trigger now)
@@ -198,6 +202,23 @@ class AutowareE2EAgent(TUMROSBaseAgent):
             self.ros_node.declare_parameter("lnr", os.environ.get("lnr", ""))
             self.ros_node.declare_parameter("imn", os.environ.get("imn", ""))
             self.ros_node.declare_parameter("gn", os.environ.get("gn", ""))
+            # imb=<t>:<bias_rad_s>: constant gyro z bias (see run_step)
+            self.ros_node.declare_parameter("imb", os.environ.get("imb", ""))
+            # rain=<t>: heavy-rain weather preset (lidar/camera degrade physically)
+            self.ros_node.declare_parameter("rain", os.environ.get("rain", ""))
+            # gb=<t>[:<dur_s>]: GNSS blackout (publish gated in this agent)
+            self.ros_node.declare_parameter("gb", os.environ.get("gb", ""))
+            # cfl=<t>: 근접 TTC ablation용 복합 고장 — t초에 선행차 급제동,
+            # t+0.8초에 카메라 파괴. TTC가 감지예산(850ms) 아래로 붕괴하는
+            # 순간의 침묵 고장 감지를 고정/동적 데드라인으로 비교한다.
+            self.ros_node.declare_parameter("cfl", os.environ.get("cfl", ""))
+            # cfl2=<t>: cfl 개선판 — 카메라 파괴를 고정 지연이 아니라
+            # "실측 TTC < 0.9s" 순간에 트리거 (동적 감지예산 이득 분리용)
+            self.ros_node.declare_parameter("cfl2", os.environ.get("cfl2", ""))
+            # lfl2=<t>: 선행차 급제동 + TTC<1.4s 순간 "전방 라이다" 파괴.
+            # 장애물 추적이 사라져 감지->DEFER 제동이 유일한 브레이크가 되는
+            # 칼날 시나리오 — 고정/동적 감지예산의 결과(충돌 여부) 차이 시험
+            self.ros_node.declare_parameter("lfl2", os.environ.get("lfl2", ""))
             # tail=<gap_m>: guarantee an NPC tailing the ego at <gap_m> meters
             # (background traffic spawns mostly ahead — rear-end pressure for
             # in-lane MRM stops needs an explicit chaser)
@@ -213,6 +234,13 @@ class AutowareE2EAgent(TUMROSBaseAgent):
         self._npc_styled = False
         self._imu_noise_sigma = 0.0
         self._gnss_noise_sigma = 0.0
+        self._imu_gyro_bias = 0.0
+        self._rain_applied = False
+        self._gnss_blackout = False
+        self._gb_bridge_sent = False
+        self._cfl_lead = None       # 선행 NPC 액터
+        self._cfl_braked = False
+        self._cfl_cam_killed = False
 
         # V2X sens gt traffic light states
         # Either the camera image or the v2x need to be set true
@@ -461,11 +489,209 @@ class AutowareE2EAgent(TUMROSBaseAgent):
         spec = self._parse_fault(self.ros_node.get_parameter("gn").value, 1.0)
         self._gnss_noise_sigma = spec[1] if spec and fault_elapsed >= spec[0] else 0.0
 
+        # imb=<t>:<bias_rad_s>: constant gyro z (yaw-rate) bias from t on.
+        # White noise (imn) is zero-mean and gets absorbed by the EKF's
+        # measurement update, but a constant bias is INTEGRATED into a
+        # steadily growing yaw error — the dangerous real-world MEMS IMU
+        # failure mode is bias instability, not white noise (Allan-variance
+        # bias-instability term, IEEE Std 952 / El-Sheimy et al. 2008).
+        spec = self._parse_fault(self.ros_node.get_parameter("imb").value, 0.02)
+        self._imu_gyro_bias = spec[1] if spec and fault_elapsed >= spec[0] else 0.0
+
+        # rain=<t>: switch the CARLA weather to a heavy downpour at t.
+        # Environmental (not component) degradation: rain physically
+        # attenuates/scatters lidar returns and degrades the camera image,
+        # so every exteroceptive sensor worsens at once. One-shot;
+        # keeps the current sun position, only precipitation-related
+        # fields are overridden (CARLA 0.9.16 carla.WeatherParameters).
+        if not self._rain_applied:
+            spec = self._parse_fault(self.ros_node.get_parameter("rain").value, 0.0)
+            if spec and fault_elapsed >= spec[0]:
+                try:
+                    world = CarlaDataProvider.get_world()
+                    weather = world.get_weather()
+                    weather.cloudiness = 90.0
+                    weather.precipitation = 90.0
+                    weather.precipitation_deposits = 80.0
+                    weather.wetness = 80.0
+                    weather.fog_density = 20.0
+                    world.set_weather(weather)
+                    print(f"[FAULT INJECTION] heavy rain applied at t+{spec[0]:.0f}s")
+                except Exception as e:
+                    print("[FAULT INJECTION] weather change failed:", e)
+                self._rain_applied = True
+
+        # gb=<t>[:<dur_s>]: GNSS blackout — this agent publishes the GNSS
+        # pose itself (see the GNSS-PosePub block below), so the blackout is
+        # a publish gate right here, NOT a bridge noise parameter like gn.
+        # The topic simply goes silent (tunnel / urban-canyon outage),
+        # exercising the monitor's timeout path instead of its noise path.
+        # Duration omitted -> blackout lasts for the rest of the run.
+        spec = self._parse_fault(self.ros_node.get_parameter("gb").value, float("inf"))
+        self._gnss_blackout = bool(spec) and spec[0] <= fault_elapsed < spec[0] + spec[1]
+        # the cpp bridge publishes the SAME topic (second publisher), so the
+        # local gate below is not enough — flip the bridge's gnss_mute too
+        # (v2 battery finding: agent-only mute left EKF fully fed)
+        if self._gnss_blackout != self._gb_bridge_sent:
+            try:
+                cli = self.ros_node.create_client(
+                    SetParameters, "/aw_carla_bridge/set_parameters")
+                req = SetParameters.Request()
+                p = RclParameter(name="gnss_mute",
+                                 value=ParameterValue(type=1, bool_value=self._gnss_blackout))
+                req.parameters = [p]
+                cli.call_async(req)
+                self._gb_bridge_sent = self._gnss_blackout
+                print(f"[FAULT INJECTION] bridge gnss_mute={self._gnss_blackout}")
+            except Exception as e:
+                print("[FAULT INJECTION] gnss_mute set failed:", e)
+
+        # cfl: 선행차 스폰(타이머 무장 직후) -> t초 급제동 -> t+0.8s 카메라 파괴
+        spec = self._parse_fault(self.ros_node.get_parameter("cfl").value, 0.0)
+        if spec:
+            try:
+                world = CarlaDataProvider.get_world()
+                ego = CarlaDataProvider.get_hero_actor()
+                if self._cfl_lead is None and ego is not None and fault_elapsed >= 0.0:
+                    tf = ego.get_transform()
+                    fwd = tf.get_forward_vector()
+                    sp = carla.Transform(
+                        carla.Location(tf.location.x + fwd.x * 22.0,
+                                       tf.location.y + fwd.y * 22.0,
+                                       tf.location.z + 0.3), tf.rotation)
+                    bp = world.get_blueprint_library().filter("vehicle.audi.tt")[0]
+                    self._cfl_lead = world.try_spawn_actor(bp, sp)
+                    if self._cfl_lead is not None:
+                        self._cfl_lead.set_autopilot(True, CarlaDataProvider.get_traffic_manager_port())
+                        tm = CarlaDataProvider.get_client().get_trafficmanager(
+                            CarlaDataProvider.get_traffic_manager_port())
+                        tm.vehicle_percentage_speed_difference(self._cfl_lead, 20.0)
+                        print("[FAULT INJECTION] cfl lead spawned 22m ahead")
+                if (self._cfl_lead is not None and not self._cfl_braked
+                        and fault_elapsed >= spec[0]):
+                    self._cfl_lead.set_autopilot(False)
+                    self._cfl_lead.apply_control(
+                        carla.VehicleControl(throttle=0.0, brake=1.0))
+                    self._cfl_braked = True
+                    print(f"[FAULT INJECTION] cfl lead HARD BRAKE at t+{spec[0]:.0f}s")
+                if (self._cfl_braked and not self._cfl_cam_killed
+                        and fault_elapsed >= spec[0] + 0.8):
+                    for actor in world.get_actors().filter("sensor.camera.rgb"):
+                        if actor.parent is not None and actor.parent.id == ego.id:
+                            actor.destroy()
+                    self._cfl_cam_killed = True
+                    self._camera_killed = True
+                    print(f"[FAULT INJECTION] cfl camera destroyed at t+{spec[0]+0.8:.1f}s (TTC collapsing)")
+            except Exception as e:
+                print("[FAULT INJECTION] cfl failed:", e)
+
+        # cfl2: 선행차 급제동 -> 에이전트가 차간/접근속도로 TTC 직접 계산
+        # -> TTC<0.9s 순간 카메라 파괴 (주입 시점의 TTC를 통제)
+        spec = self._parse_fault(self.ros_node.get_parameter("cfl2").value, 0.0)
+        if spec:
+            try:
+                world = CarlaDataProvider.get_world()
+                ego = CarlaDataProvider.get_hero_actor()
+                # JIT 스폰: 제동 2초 전, 에고 전방 20m, 에고 속도 매칭
+                # (조기 스폰 + autopilot은 90m 도주 실측 -> 폐기)
+                if (self._cfl_lead is None and ego is not None
+                        and fault_elapsed >= spec[0] - 2.0):
+                    tf = ego.get_transform(); fwd = tf.get_forward_vector()
+                    for ahead in (20.0, 26.0, 32.0):
+                        sp = carla.Transform(
+                            carla.Location(tf.location.x + fwd.x * ahead,
+                                           tf.location.y + fwd.y * ahead,
+                                           tf.location.z + 0.5), tf.rotation)
+                        bp = world.get_blueprint_library().filter("vehicle.audi.tt")[0]
+                        self._cfl_lead = world.try_spawn_actor(bp, sp)
+                        if self._cfl_lead is not None:
+                            ev = ego.get_velocity()
+                            self._cfl_lead.set_target_velocity(ev)
+                            print(f"[FAULT INJECTION] cfl2 lead JIT-spawn {ahead:.0f}m ahead, v-matched")
+                            break
+                if (self._cfl_lead is not None and not self._cfl_braked
+                        and fault_elapsed >= spec[0]):
+                    self._cfl_lead.set_autopilot(False)
+                    self._cfl_lead.apply_control(
+                        carla.VehicleControl(throttle=0.0, brake=1.0))
+                    self._cfl_braked = True
+                    print(f"[FAULT INJECTION] cfl2 lead HARD BRAKE at t+{spec[0]:.0f}s")
+                if (self._cfl_braked and not self._cfl_cam_killed
+                        and ego is not None and self._cfl_lead is not None):
+                    el = ego.get_location(); ll = self._cfl_lead.get_location()
+                    gap = ((el.x-ll.x)**2 + (el.y-ll.y)**2) ** 0.5 - 4.5
+                    ev = ego.get_velocity(); lv = self._cfl_lead.get_velocity()
+                    closing = ((ev.x-lv.x)**2+(ev.y-lv.y)**2)**0.5
+                    ttc = gap / closing if closing > 0.5 else 99.0
+                    if self._counter % 10 == 0:
+                        print(f"[TTCDBG] gap={gap:.1f} closing={closing:.2f} ttc={ttc:.2f}")
+                    # 0.9->1.8 상향에도 불발: 에고 AEB가 더 빨랐음. 계측 후 재결정
+                    if ttc < 1.8:
+                        for actor in world.get_actors().filter("sensor.camera.rgb"):
+                            if actor.parent is not None and actor.parent.id == ego.id:
+                                actor.destroy()
+                        self._cfl_cam_killed = True
+                        self._camera_killed = True
+                        print(f"[FAULT INJECTION] cfl2 camera destroyed at TTC={ttc:.2f}s gap={gap:.1f}m")
+            except Exception as e:
+                print("[FAULT INJECTION] cfl2 failed:", e)
+
+        # lfl2: 선행차 급제동 -> 에이전트가 차간/접근속도로 TTC 직접 계산
+        # -> TTC<0.9s 순간 카메라 파괴 (주입 시점의 TTC를 통제)
+        spec = self._parse_fault(self.ros_node.get_parameter("lfl2").value, 0.0)
+        if spec:
+            try:
+                world = CarlaDataProvider.get_world()
+                ego = CarlaDataProvider.get_hero_actor()
+                # JIT 스폰: 제동 2초 전, 에고 전방 20m, 에고 속도 매칭
+                # (조기 스폰 + autopilot은 90m 도주 실측 -> 폐기)
+                if (self._cfl_lead is None and ego is not None
+                        and fault_elapsed >= spec[0] - 2.0):
+                    tf = ego.get_transform(); fwd = tf.get_forward_vector()
+                    for ahead in (20.0, 26.0, 32.0):
+                        sp = carla.Transform(
+                            carla.Location(tf.location.x + fwd.x * ahead,
+                                           tf.location.y + fwd.y * ahead,
+                                           tf.location.z + 0.5), tf.rotation)
+                        bp = world.get_blueprint_library().filter("vehicle.audi.tt")[0]
+                        self._cfl_lead = world.try_spawn_actor(bp, sp)
+                        if self._cfl_lead is not None:
+                            ev = ego.get_velocity()
+                            self._cfl_lead.set_target_velocity(ev)
+                            print(f"[FAULT INJECTION] lfl2 lead JIT-spawn {ahead:.0f}m ahead, v-matched")
+                            break
+                if (self._cfl_lead is not None and not self._cfl_braked
+                        and fault_elapsed >= spec[0]):
+                    self._cfl_lead.set_autopilot(False)
+                    self._cfl_lead.apply_control(
+                        carla.VehicleControl(throttle=0.0, brake=1.0))
+                    self._cfl_braked = True
+                    print(f"[FAULT INJECTION] lfl2 lead HARD BRAKE at t+{spec[0]:.0f}s")
+                if (self._cfl_braked and not self._cfl_cam_killed
+                        and ego is not None and self._cfl_lead is not None):
+                    el = ego.get_location(); ll = self._cfl_lead.get_location()
+                    gap = ((el.x-ll.x)**2 + (el.y-ll.y)**2) ** 0.5 - 4.5
+                    ev = ego.get_velocity(); lv = self._cfl_lead.get_velocity()
+                    closing = ((ev.x-lv.x)**2+(ev.y-lv.y)**2)**0.5
+                    ttc = gap / closing if closing > 0.5 else 99.0
+                    if ttc < 1.8:
+                        for actor in world.get_actors().filter("sensor.lidar.ray_cast"):
+                            if (actor.parent is not None and actor.parent.id == ego.id
+                                    and "front" in (actor.attributes.get("role_name","")
+                                                    + actor.attributes.get("ros_name",""))):
+                                actor.destroy()
+                        self._cfl_cam_killed = True
+                        self._lidar_killed = True
+                        print(f"[FAULT INJECTION] lfl2 FRONT LIDAR destroyed at TTC={ttc:.2f}s gap={gap:.1f}m")
+            except Exception as e:
+                print("[FAULT INJECTION] lfl2 failed:", e)
+
         # single latched "fault is now live" signal for the experiment judge
         if not self._fault_announced and (
                 self._bridge_noise_started or self._camera_killed
                 or self._lidar_killed or self._imu_noise_sigma > 0.0
-                or self._gnss_noise_sigma > 0.0):
+                or self._gnss_noise_sigma > 0.0 or self._imu_gyro_bias != 0.0
+                or self._rain_applied or self._gnss_blackout):
             self._fault_announced = True
             self._fault_active_pub.publish(Bool(data=True))
             print(f"[FAULT INJECTION] fault ACTIVE at t+{fault_elapsed:.1f}s (announced)")
@@ -492,7 +718,9 @@ class AutowareE2EAgent(TUMROSBaseAgent):
         if self._gnss_noise_sigma > 0.0:
             ndt_pose_msg.pose.pose.position.x += float(np.random.normal(0.0, self._gnss_noise_sigma))
             ndt_pose_msg.pose.pose.position.y += float(np.random.normal(0.0, self._gnss_noise_sigma))
-        self._gnss_pose_pub.publish(ndt_pose_msg)
+        # gb: during a GNSS blackout the pose is simply not published
+        if not self._gnss_blackout:
+            self._gnss_pose_pub.publish(ndt_pose_msg)
 
         # Steering Angle
         steering_angle = self._awp_converter._get_steering()
@@ -539,6 +767,10 @@ class AutowareE2EAgent(TUMROSBaseAgent):
             imu_msg.linear_acceleration.x += float(np.random.normal(0.0, 10.0 * s))
             imu_msg.linear_acceleration.y += float(np.random.normal(0.0, 10.0 * s))
             imu_msg.linear_acceleration.z += float(np.random.normal(0.0, 10.0 * s))
+        # imb: constant yaw-rate bias on the gyro z axis (integrates into a
+        # growing heading error downstream — see the imb comment in run_step)
+        if self._imu_gyro_bias != 0.0:
+            imu_msg.angular_velocity.z += float(self._imu_gyro_bias)
         self._imu_pub.publish(imu_msg)
         
         if self._use_v2x_traffic_light:
