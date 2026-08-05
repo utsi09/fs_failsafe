@@ -1,0 +1,2 @@
+idx,fault,severity,trigger_s,npc,rep,outcome,final_state,stop_x,stop_y,time_to_stop_s,collisions,wall_s
+0,ln,mid,40,def,0,SCENARIO_ENDED,MRM_DEFER:shoulder_1002323,-44.7,3.5,,0,266.2

@@ -1,0 +1,6 @@
+idx,method,fault,severity,trigger_s,npc,rep,outcome,final_state,aw_mrm,stop_x,stop_y,lane_overlap_m,lane_block_pct,det_latency_s,tts_fault_s,deg_dist_m,min_gap_m,traffic,time_to_stop_s,collisions,collision_types,stall_factor,t_hazard_s,wall_s
+0,ours,cfl,mid,40,agg,0,SCENARIO_ENDED,MRM_MOVE:shoulder_1002596,EMERGENCY_STOP,-2.1,-16.7,1.9,54.3,2.6,-16.2,0.6,3.7,,-18.8,0,,,,226.2
+1,ours,cfl,mid,32,agg,1,AW_EMERGENCY_STOP_DONE,MRM_DEFER:shoulder_1002596,EMERGENCY_STOP,-2.1,-17.3,1.9,54.3,2.5,-7.4,0.5,4.1,,-9.9,0,,,,208.9
+2,ours,cfl,mid,41,agg,2,SHOULDER_SUCCESS,MRM_PARKED:shoulder_1002468,EMERGENCY_STOP,-96.5,28.9,0.95,18.2,2.4,16.1,58.0,2.7,cleared,13.7,,,,,132.6
+3,ours,cfl,mid,43,agg,3,SHOULDER_SUCCESS,MRM_PARKED:shoulder_1002468,EMERGENCY_STOP,-96.5,26.9,0.95,18.1,2.5,14.5,54.0,2.7,cleared,12.0,,,,,133.7
+4,ours,cfl,mid,14,agg,4,AW_EMERGENCY_STOP_DONE,MRM_DEFER:shoulder_1002596,EMERGENCY_STOP,-2.1,-17.4,1.9,54.3,4.8,7.8,29.1,3.2,,3.1,0,,,,221.0

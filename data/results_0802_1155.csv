@@ -1,0 +1,14 @@
+idx,method,fault,severity,trigger_s,npc,rep,outcome,final_state,aw_mrm,stop_x,stop_y,lane_overlap_m,lane_block_pct,det_latency_s,tts_fault_s,deg_dist_m,min_gap_m,traffic,time_to_stop_s,collisions,collision_types,stall_factor,t_hazard_s,wall_s
+0,ours,nf,mid,24,def,0,AW_EMERGENCY_STOP_DONE,MRM_DEFER,EMERGENCY_STOP,-140.5,98.6,0.95,16.8,,,,,blocked,,,,,,174.8
+1,baseline,nf,mid,24,def,0,STUCK_AT_JUNCTION,NORMAL,EMERGENCY_STOP,-107.9,36.0,1.9,76.3,,,,,,,,,,,226.4
+2,ours,nf,mid,22,def,1,STUCK_AT_JUNCTION,NORMAL,,-107.6,35.9,1.9,76.3,,,,,,,,,,,224.2
+3,baseline,nf,mid,22,def,1,STUCK_AT_JUNCTION,NORMAL,EMERGENCY_STOP,-107.4,36.0,1.9,76.3,,,,,,,,,,,226.2
+4,ours,nf,mid,35,def,2,CARLA_DIED,NORMAL,EMERGENCY_STOP,-107.1,36.0,1.9,76.3,,,,,,,,,,,196.0
+5,baseline,nf,mid,35,def,2,SCENARIO_ENDED,,,nan,nan,,,,,,,,,,,,,69.0
+6,ours,nf,mid,44,def,3,SETUP_FAIL,ego odometry never appeared,,,,,,,,,,,,,,,,227.0
+7,baseline,nf,mid,44,def,3,SCENARIO_ENDED,,,nan,nan,,,,,,,,,,,,,67.0
+8,ours,nf,mid,34,def,4,SCENARIO_ENDED,,,nan,nan,,,,,,,,,,,,,200.5
+9,baseline,nf,mid,34,def,4,SETUP_FAIL,ego odometry never appeared,,,,,,,,,,,,0,,,,1492.5
+10,ours,nf,mid,45,agg,0,SETUP_FAIL,ego odometry never appeared,,,,,,,,,,,,0,,,,233.3
+11,baseline,nf,mid,45,agg,0,SCENARIO_ENDED,,,nan,nan,,,,,,,,,,,,,69.1
+12,ours,nf,mid,42,agg,1,SCENARIO_ENDED,,,nan,nan,,,,,,,,,,,,,116.2

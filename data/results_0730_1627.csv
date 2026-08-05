@@ -1,0 +1,2 @@
+idx,method,fault,severity,trigger_s,npc,rep,outcome,final_state,aw_mrm,stop_x,stop_y,lane_overlap_m,lane_block_pct,det_latency_s,tts_fault_s,deg_dist_m,min_gap_m,time_to_stop_s,collisions,collision_types,wall_s
+0,ours,gn,mid,10,def,0,INTERRUPTED,MRM_MOVE:shoulder_1002291,EMERGENCY_STOP,-14.4,3.2,1.49,42.6,2.3,18.4,67.3,3.4,,,,122.3

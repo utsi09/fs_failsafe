@@ -1,0 +1,2 @@
+idx,method,fault,severity,trigger_s,npc,rep,outcome,final_state,aw_mrm,stop_x,stop_y,time_to_stop_s,collisions,collision_types,wall_s
+0,ours,ln,low,20,def,0,AW_EMERGENCY_STOP_DONE,MRM_MOVE:shoulder_1002248,EMERGENCY_STOP,-0.2,-25.2,,,,92.0

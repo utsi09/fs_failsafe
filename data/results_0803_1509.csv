@@ -1,0 +1,6 @@
+idx,method,fault,severity,trigger_s,npc,rep,outcome,final_state,aw_mrm,stop_x,stop_y,lane_overlap_m,lane_block_pct,det_latency_s,tts_fault_s,deg_dist_m,min_gap_m,traffic,time_to_stop_s,collisions,collision_types,stall_factor,t_hazard_s,wall_s
+0,ours,cf,mid,21,agg,0,SHOULDER_SUCCESS,MRM_PARKED:shoulder_1002507,EMERGENCY_STOP,-0.0,34.4,0.95,24.8,2.6,17.6,50.4,5.1,blocked,15.0,,,,,116.1
+1,ours,cf,mid,13,agg,1,AW_EMERGENCY_STOP_DONE,MRM_DEFER:shoulder_1002596,COMFORTABLE_STOP+EMERGENCY_STOP,-2.1,-17.1,1.9,54.3,4.5,7.5,29.9,4.2,,3.1,0,,,,206.7
+2,ours,cf,mid,30,agg,2,AW_COMFORTABLE_STOP_DONE,MRM_DEFER:shoulder_1002596,EMERGENCY_STOP+COMFORTABLE_STOP,-0.2,218.2,1.9,54.3,2.4,34.2,196.5,3.9,,31.9,0,,,,256.0
+3,ours,cf,mid,38,agg,3,AW_COMFORTABLE_STOP_DONE,MRM_DEFER:shoulder_1002596,EMERGENCY_STOP+COMFORTABLE_STOP,-0.2,218.4,1.9,54.3,2.3,90.7,185.2,3.1,,88.4,0,,,,327.7
+4,ours,cf,mid,32,agg,4,AW_COMFORTABLE_STOP_DONE,MRM_MOVE:shoulder_1002596,EMERGENCY_STOP+COMFORTABLE_STOP,-0.2,218.0,1.9,54.3,2.5,76.3,190.9,3.9,,73.8,0,,,,300.1

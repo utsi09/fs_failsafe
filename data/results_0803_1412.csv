@@ -1,0 +1,5 @@
+idx,method,fault,severity,trigger_s,npc,rep,outcome,final_state,aw_mrm,stop_x,stop_y,lane_overlap_m,lane_block_pct,det_latency_s,tts_fault_s,deg_dist_m,min_gap_m,traffic,time_to_stop_s,collisions,collision_types,stall_factor,t_hazard_s,wall_s
+0,ours,ln,mid,12,agg,0,AW_COMFORTABLE_STOP_DONE,MRM_MOVE:shoulder_1002500,COMFORTABLE_STOP,-2.5,-38.1,1.9,54.3,1.1,3.3,11.8,0.3,blocked,2.2,,,,,101.0
+1,ours,ln,mid,10,agg,1,AW_COMFORTABLE_STOP_DONE,MRM_MOVE:shoulder_1002500,EMERGENCY_STOP+COMFORTABLE_STOP,-2.7,-46.5,1.9,54.3,1.2,3.2,9.4,0.3,blocked,2.0,,,,,99.1
+2,ours,ln,mid,27,agg,2,AW_COMFORTABLE_STOP_DONE,MRM_MOVE:shoulder_1002445,EMERGENCY_STOP+COMFORTABLE_STOP,-15.4,3.3,1.9,54.4,1.1,15.1,17.8,0.4,cleared,14.1,,,,,124.3
+3,ours,ln,mid,25,agg,3,AW_COMFORTABLE_STOP_DONE,MRM_MOVE:shoulder_1002445,COMFORTABLE_STOP,-11.7,3.2,1.9,54.3,1.2,4.6,10.0,5.1,cleared,3.4,,,,,113.1

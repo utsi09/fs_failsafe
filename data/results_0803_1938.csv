@@ -1,0 +1,2 @@
+idx,method,fault,severity,trigger_s,npc,rep,outcome,final_state,aw_mrm,stop_x,stop_y,lane_overlap_m,lane_block_pct,det_latency_s,tts_fault_s,deg_dist_m,min_gap_m,traffic,time_to_stop_s,collisions,collision_types,stall_factor,t_hazard_s,wall_s
+0,ours,cfl2,mid,28,agg,0,STUCK_AT_JUNCTION,NORMAL,EMERGENCY_STOP,-124.3,97.9,1.9,66.6,,,,,,,,,goal-planner,,263.9

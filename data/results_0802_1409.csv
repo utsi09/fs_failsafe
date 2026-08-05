@@ -1,0 +1,13 @@
+idx,method,fault,severity,trigger_s,npc,rep,outcome,final_state,aw_mrm,stop_x,stop_y,lane_overlap_m,lane_block_pct,det_latency_s,tts_fault_s,deg_dist_m,min_gap_m,traffic,time_to_stop_s,collisions,collision_types,stall_factor,t_hazard_s,wall_s
+0,ours,nf,mid,24,def,0,STUCK_AT_JUNCTION,NORMAL,EMERGENCY_STOP,-107.2,36.0,1.9,76.3,,,,,,,,,,,230.3
+1,baseline,nf,mid,24,def,0,STUCK_AT_JUNCTION,NORMAL,EMERGENCY_STOP,-123.9,97.9,1.9,66.6,,,,,,,,,goal-planner,,263.1
+2,ours,nf,mid,22,def,1,STUCK_AT_JUNCTION,NORMAL,,-107.6,36.0,1.9,76.3,,,,,,,,,,,226.3
+3,baseline,nf,mid,22,def,1,STUCK_AT_JUNCTION,NORMAL,EMERGENCY_STOP,-107.6,35.9,1.9,76.3,,,,,,,,,,,223.5
+4,ours,nf,mid,35,def,2,STUCK_AT_JUNCTION,NORMAL,EMERGENCY_STOP,-126.0,97.9,1.9,66.6,,,,,,,,,goal-planner,,278.8
+5,baseline,nf,mid,35,def,2,STUCK_AT_JUNCTION,NORMAL,EMERGENCY_STOP,-126.3,97.9,1.9,66.6,,,,,,,,,goal-planner,,277.2
+6,ours,nf,mid,44,def,3,STUCK_AT_JUNCTION,NORMAL,EMERGENCY_STOP,-103.1,34.9,1.9,59.6,,,,,,,,,,,234.8
+7,baseline,nf,mid,44,def,3,STUCK_AT_JUNCTION,NORMAL,EMERGENCY_STOP,-126.3,97.9,1.9,66.6,,,,,,,,,goal-planner,,266.5
+8,ours,nf,mid,34,def,4,AW_COMFORTABLE_STOP_DONE,MRM_DEFER:shoulder_1002323,EMERGENCY_STOP+COMFORTABLE_STOP,-125.5,97.9,1.9,66.6,,,,,,-5.4,1,layout:1,,,315.4
+9,baseline,nf,mid,34,def,4,STUCK_AT_JUNCTION,NORMAL,EMERGENCY_STOP,-126.4,97.9,1.9,66.6,,,,,,,,,goal-planner,,258.2
+10,ours,nf,mid,45,agg,0,STUCK_AT_JUNCTION,NORMAL,EMERGENCY_STOP,-107.3,36.0,1.9,76.3,,,,,,,,,,,227.7
+11,baseline,nf,mid,45,agg,0,CARLA_DIED,NORMAL,,7.5,-59.3,1.9,54.3,,,,,,,,,,,74.7

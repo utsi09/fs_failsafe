@@ -1,0 +1,6 @@
+idx,method,fault,severity,trigger_s,npc,rep,outcome,final_state,aw_mrm,stop_x,stop_y,lane_overlap_m,lane_block_pct,det_latency_s,tts_fault_s,deg_dist_m,min_gap_m,traffic,time_to_stop_s,collisions,collision_types,stall_factor,t_hazard_s,wall_s
+0,ours,gn,high,14,agg,0,HAZARD_STOPPED,,EMERGENCY_STOP,-125.7,97.9,1.9,66.6,,130.6,290.8,2.4,,,,,,130.6,274.0
+1,ours,gn,high,14,agg,1,HAZARD_STOPPED,,EMERGENCY_STOP,-125.7,97.9,1.9,66.6,,72.9,288.3,4.8,,,,,,72.9,216.5
+2,ours,gn,high,26,agg,2,HAZARD_STOPPED,,EMERGENCY_STOP,-125.8,97.9,1.9,66.6,,111.3,253.0,4.0,,,,,,111.3,265.0
+3,ours,gn,high,21,agg,3,HAZARD_STOPPED,,EMERGENCY_STOP,-107.4,36.0,1.9,76.3,,40.0,145.6,4.0,,,,,,40.0,189.0
+4,ours,gn,high,34,agg,4,HAZARD_STOPPED,,EMERGENCY_STOP,-126.5,97.9,1.9,66.6,,55.5,213.0,4.3,,,,,,55.5,214.7

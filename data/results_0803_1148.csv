@@ -1,0 +1,6 @@
+idx,method,fault,severity,trigger_s,npc,rep,outcome,final_state,aw_mrm,stop_x,stop_y,lane_overlap_m,lane_block_pct,det_latency_s,tts_fault_s,deg_dist_m,min_gap_m,traffic,time_to_stop_s,collisions,collision_types,stall_factor,t_hazard_s,wall_s
+0,ours,nf,mid,24,def,0,STUCK_AT_JUNCTION,NORMAL,EMERGENCY_STOP,-148.2,76.6,1.9,61.3,,,,,,,,,,,269.4
+1,ours,nf,mid,22,def,1,STUCK_AT_JUNCTION,NORMAL,EMERGENCY_STOP,-107.7,36.0,1.9,76.3,,,,,,,,,,,227.7
+2,ours,nf,mid,35,def,2,STUCK_AT_JUNCTION,NORMAL,EMERGENCY_STOP,-148.3,74.6,1.9,61.3,,,,,,,,,,,254.1
+3,ours,nf,mid,44,def,3,STUCK_AT_JUNCTION,NORMAL,EMERGENCY_STOP,-148.3,74.6,1.9,61.3,,,,,,,,,,,271.3
+4,ours,nf,mid,34,def,4,STUCK_AT_JUNCTION,NORMAL,EMERGENCY_STOP,-148.3,76.6,1.9,61.3,,,,,,,,,,,267.2

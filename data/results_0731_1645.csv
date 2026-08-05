@@ -1,0 +1,2 @@
+idx,method,fault,severity,trigger_s,npc,rep,outcome,final_state,aw_mrm,stop_x,stop_y,lane_overlap_m,lane_block_pct,det_latency_s,tts_fault_s,deg_dist_m,min_gap_m,traffic,time_to_stop_s,collisions,collision_types,wall_s
+0,ours,ln,mid,12,agg,0,AW_COMFORTABLE_STOP_DONE,MRM_DEFER:shoulder_1002450,EMERGENCY_STOP+COMFORTABLE_STOP,-2.6,-46.0,1.9,54.3,1.1,1.5,6.5,0.4,,,0,,214.8

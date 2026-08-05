@@ -1,0 +1,2 @@
+idx,method,fault,severity,trigger_s,npc,rep,outcome,final_state,aw_mrm,stop_x,stop_y,time_to_stop_s,collisions,collision_types,wall_s
+0,ours,lnf,mid,20,agg,0,INTERRUPTED,,,nan,nan,,,,196.4
