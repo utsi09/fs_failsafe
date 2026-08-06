@@ -103,6 +103,7 @@ maneuver, FTTI, sensor fault detection, behavior tree, Autoware, CARLA
 - 그림 5-1 갓길 대피 완료 장면(실측 좌표 재현) · 그림 5-2 대피 정차의 기하(탑뷰)
 
 **표 목차**
+- 표 2-1 기존 연구 계열과 본 연구의 비교 (6축)
 - 표 5-1 감지 성능 · 표 5-2 방식 비교 · 표 5-3 단계적 대응 · 표 5-4 무개입 위험 도달 시간
 - 표 5-5 동적 예산 ablation · 표 5-6 τ_fresh 민감도 · 표 5-7 안전 부대 지표 · 표 8-1 시간 파라미터 일람
 
@@ -196,59 +197,148 @@ hold)를 포함한다.
 
 ## 제 2 장  배경 및 관련 연구
 
-### 2.1 FTTI와 시간 예산의 도출
+관련 연구를 여섯 갈래 — 표준·규제(2.1), 시간 예산(2.2), 고장 감지
+이론과 센서별 감시(2.3), 폴백·MRM 계획(2.4), 능력 기반 자기감시와 런타임
+모니터링(2.5), 시뮬레이션 기반 평가(2.6) — 로 정리하고, 2.7에서 본 연구와
+기존 연구를 여섯 개 축으로 비교하는 표를 제시한다.
+
+### 2.1 표준과 규제 프레임
+
+기능안전 표준 ISO 26262[1]는 E/E 시스템 고장의 감지·대응 시간 요구(FTTI)
+를 규정하고, SOTIF(ISO 21448)[2]는 고장이 아닌 성능 한계 — 센서 열화,
+악천후 — 로 인한 위험까지 관리 범위를 확장한다. SAE J3016[3]은 자동화
+수준과 최소위험상태(MRC)·폴백 개념을 정의하며, UNECE R157(ALKS)[4]은
+양산 규제로서 MRM의 발동 조건과 거동(감속 정차, 위험 최소화)을 요구한다.
+UL 4600[5]과 ISO/TR 4804[6]는 자율주행 안전 사례(safety case)의 구성
+요소로 런타임 감시와 열화 대응을 명시한다. AUTOSAR Watchdog Manager[7]는
+100ms급 주기 감시(alive/deadline supervision)의 산업 관행을 보여준다.
+이들 표준은 "무엇이 요구되는가"를 정의하지만, 센서 고장의 종류·정도를
+연속적으로 추정해 대응을 구분 선택하는 구체적 방법은 제공하지 않는다 —
+본 연구가 다루는 지점이다.
+
+### 2.2 FTTI와 시간 예산의 도출
 
 ISO 26262(2판)는 FTTI를 "고장 발생부터, 안전장치가 작동하지 않는다는 가정
 하에 위험 사건이 발생할 수 있는 시점까지의 최소 시간"으로 정의한다.
 표준은 구체적 수치를 제공하지 않으며, FTTI는 안전목표별로 차량 동역학과
-시나리오에서 도출되어야 한다. Bosch의 산정 방법(US12347247B2)은 차로유지
-기능 상실 시나리오에서 차로폭 3.5m, 차폭 1.8m, 속도 120km/h, 곡률반경
-1500m 조건의 차로 경계 도달 시간을 시험과 시뮬레이션으로 구해 1.4~1.8초의
-FTTI를 도출한 대표 사례이다. 본 연구는 이 접근을 따라 FTTI를 감지
-시간(FDTI)과 반응 시간(FRTI), 안전여유로 분해하고, 감시를 비활성화한
+시나리오에서 도출되어야 한다. Bosch의 산정 방법(US12347247B2)[8]은
+차로유지 기능 상실 시나리오에서 차로폭 3.5m, 차폭 1.8m, 속도 120km/h,
+곡률반경 1500m 조건의 차로 경계 도달 시간을 시험과 시뮬레이션으로 구해
+1.4~1.8초의 FTTI를 도출한 대표 사례이다. 위험도 지표로는 충돌까지의
+시간(TTC)[9]과 그 확장형[10]이 표준적으로 쓰이며, RSS[11]는 최악가정
+운동학으로 안전 거리를 형식화한다. 본 연구는 FTTI를 감지 시간(FDTI)과
+반응 시간(FRTI), 안전여유로 분해하는 프레임을 채택하되, 감시를 비활성화한
 무개입 실험으로 고장 유형별 위험 도달 시간을 직접 측정한다(5.3절).
-중요한 것은 위험 도달 시간이 고장 유형에 따라 두 자릿수 배율로
-달라진다는 점이며(2~131초), 이는 단일 FTTI가 아닌 고장별 예산이 필요함을
-시사한다.
+중요한 것은 위험 도달 시간이 고장 유형에 따라 두 자릿수 배율로 달라진다는
+점이며(2~131초), 이는 단일 FTTI가 아닌 고장별 예산이 필요함을 시사한다.
 
-### 2.2 인지 상실 시의 보수적 거동
+### 2.3 고장 감지 이론과 센서별 감시
 
-Emzivat 등(2017)은 주행 환경 감시 능력이 손상된 자율주행 시스템의 동적
-주행과업 폴백을 다루며, 감시가 불가능해진 영역에 가상의 장애물(ghost
-object)을 두고 그에 대한 TTC 기반 감속을 수행하는 접근을 제안했다. 본
-연구의 fail-conservative TTC 홀드 — 충돌 시간을 측정하는 센서가 불량할
-때, 마지막으로 관측된 장애물이 동일한 접근 속도로 계속 다가온다고
-가정하여 TTC 하한을 시간에 따라 감쇠시키는 최악가정 전파 — 는 이 관점의
-연장선에 있다.
+**고전 FDI 이론.** 동적 시스템의 고장 감지는 Willsky의 초기 서베이[12]
+이래 잔차(residual) 생성과 판정의 문제로 정식화되었고, Isermann[13][14]과
+Gao 등[15]의 서베이가 모델 기반·신호 기반·지식 기반 계열을 정리한다.
+순차 변화 감지는 Page의 CUSUM[16]과 Basseville-Nikiforov의 체계[17]가
+고전이며, 본 연구의 라이다 품질 채널은 CUSUM을 차용한다(3.2절). 이들
+이론은 "감지"까지를 다루며, 감지 이후의 기동 선택은 범위 밖이다.
 
-### 2.3 센서 이상 감지
+**라이다.** 실차용으로는 Autoware의 ring_outlier_filter와
+blockage_diag[18]가 인접 포인트 거리 변화와 차폐 영역 진단을 제공하고,
+PCL[19]의 Statistical/Radius Outlier Removal은 공간 이웃 통계로 이상점을
+판정한다. 악천후 열화의 정량화는 안개 챔버 벤치마크[20], 기상 분류[21],
+강우 열화 정량화[22][23]가 다룬다. 본 연구의 라이다 품질 지표는 이들과
+원리를 공유하되 목적이 다르다: 이상점의 "제거"가 아니라 센서 상태의
+"점수화"이며, 계산량을 실시간 감시 수준으로 억제한 경량 상대 지표이다
+(따라서 "상대 거리불연속 점수"로 명명한다, 3.2절). 산업계 라이다
+상태감시의 100ms 주기 검사·3회 연속 디바운스 관행은 본 연구의 k-미스
+침묵 감지와 정합한다.
 
-라이다 데이터 이상 감지에 관해 Autoware는 동일 스캔 링 내 인접 포인트의
-거리 변화로 우적·분진 포인트를 제거하는 ring_outlier_filter와 차폐 영역을
-진단하는 blockage_diag를 실차용으로 제공한다. 포인트클라우드
-라이브러리(PCL)의 Statistical/Radius Outlier Removal은 공간 이웃 통계로
-이상점을 판정한다. 본 연구의 라이다 품질 지표는 이들과 원리를 공유하되
-목적이 다르다: 이상점의 "제거"가 아니라 센서 상태의 "점수화"이며, 계산량을
-실시간 감시 수준으로 억제한 경량 상대 지표이다. 따라서 본 논문은 이를
-표준적 노이즈 추정기가 아닌 "상대 거리불연속 점수"로 명명한다(3.2절).
-산업계 라이다 상태감시는 TimeSync 오류의 100ms 주기 검사, 윈도우 차폐의
-3회 연속 디바운스 등 짧은 주기·연속 확인 관행을 보이며, 본 연구의 k-미스
-침묵 감지(수신 주기 3배 결손 시 조기 의심)는 이 관행과 정합한다.
+**카메라.** Secci와 Ceccarelli[24]는 RGB 카메라의 고장 모드(사망, 노이즈,
+블러, 노출 이상 등)를 분류하고 자율주행 지각에 미치는 영향을 분석했다 —
+본 연구의 카메라 고장 주입(cn, cf)은 이 분류의 대표 모드에 해당한다.
 
-IMU에 관한 문헌은 차량용 MEMS 자이로의 측정 노이즈가 20Hz 기준 표준편차
-0.04~0.09deg/s 수준이고, 실제 위험은 백색노이즈가 아니라 시간에 따라
-누적되는 바이어스 불안정성임을 지적한다. 본 연구의 실험 설계(백색노이즈
-imn과 바이어스 imb의 분리)와 결과(백색노이즈 미감지·무해, 바이어스 전용
-채널 감지)는 이 문헌과 정합한다. GNSS에 관해서는 도심 멀티패스 오차가
-수 m에서 30m에 이른다는 보고가 있으며, 본 실험의 주입 강도(1.0/2.5m)는
-이 범위의 하단부에 해당하는 현실적 열화이다.
+**IMU.** Allan 분산 기반의 관성센서 노이즈 모델링[25]과 차량용 MEMS
+등급 평가[26]는 측정 백색노이즈(20Hz 기준 σ 0.04~0.09deg/s)보다 시간
+누적되는 바이어스 불안정성이 실제 위험임을 지적한다. 본 연구의 실험
+설계(백색노이즈 imn과 바이어스 imb의 분리)와 결과(백색노이즈
+미감지·무해, 바이어스 전용 채널 감지)는 이 문헌과 정합한다.
 
-### 2.4 시뮬레이션 기반 평가
+**GNSS·측위 무결성.** 도심 멀티패스 오차는 수 m에서 30m에 이르며[27],
+도심 GNSS 무결성 감시의 문헌 리뷰[28]와 자율주행 측위 요구사항 분석[29]이
+잔차·보호수준 기반 감시의 준거를 제공한다. 본 실험의 주입 강도(1.0/2.5m)
+는 보고된 오차 범위의 하단부에 해당하는 현실적 열화이다.
 
-CARLA는 센서 모델과 교통 제어를 제공하는 공개 시뮬레이터로, 고장 주입
-연구의 표준적 플랫폼이다. 본 연구는 CARLA 0.9.16과 Autoware(main)를
+### 2.4 폴백·MRM 계획
+
+고장·성능 한계 시의 안전 정지 계획은 두 흐름이 있다. **궤적 계획
+흐름**은 매 계획 주기마다 안전 정지 궤적을 병행 유지(fail-safe motion
+planning)[30]하거나, 안전 정지를 최적제어 문제로 정식화[31]하거나,
+계획된 궤적을 온라인 검증으로 걸러 사고를 방지한다[32]. 이들은 "어떻게
+멈출 것인가"의 기하·동역학을 다루지만, 고장의 종류·정도 평가와 대응
+전략의 선택은 전제로 둔다. **폴백 전략 흐름**으로 Emzivat 등[33]은 주행
+환경 감시 능력이 손상된 시스템의 동적 주행과업 폴백을 다루며, 감시
+불가능 영역에 가상 장애물(ghost object)을 두고 TTC 기반 감속을 수행하는
+접근을 제안했다 — 본 연구의 fail-conservative TTC 홀드(충돌 시간 측정원
+자신이 불량할 때 마지막 관측 접근속도로 TTC 하한을 감쇠시키는 최악가정
+전파)는 이 관점의 연장선에 있다. Reschka와 Maurer[34]는 자동화 차량의
+"안전 상태"가 상황 의존적이며 차로 내 정차가 항상 안전하지 않음을
+지적했다 — 본 연구의 출발 문제의식과 같다. 오픈소스 스택 Autoware[18]는
+comfortable/emergency stop과 갓길 지향 pull_over 상태를 제공하나, 고장의
+종류·정도와 잔여 능력을 평가해 대피/정차를 구분 선택하는 감독 계층은
+제공하지 않는다(1.1절).
+
+### 2.5 능력 기반 자기감시와 런타임 모니터링
+
+Reschka 등[35]의 능력·기술 그래프(ability and skill graphs)는 차량 유도
+시스템의 기능 능력을 계층 그래프로 모델링해 온라인 감시와 의사결정에
+쓰자는 제안이며, Nolte 등[36]은 이를 개발 프로세스로 확장했다. 본 연구의
+섹터·능력 합성(3.3절)은 이 계보의 구체적 구현에 해당하되, 능력 점수를
+MRM 등급 선택(대피/위임)과 위험 유예에 직접 결합한 점이 다르다. 런타임
+검증 계열로는 자율주행 연구 차량의 런타임 모니터 사례 연구[37], 안전
+모니터 합성 프레임워크 SMOF[38]가 있으며, 자율주행 시험·검증의 난제
+전반은 Koopman과 Wagner[39]가 정리한다. 행동트리는 로봇 분야의 모듈형
+과업 구조로 정착했고[40][41], 본 연구는 BehaviorTree.CPP[42]를 감시
+노드의 병렬 구성·실행 추적 구조로 사용한다(알고리즘적 기여가 아니라 구현
+구조임을 3.1절에 명시).
+
+### 2.6 시뮬레이션 기반 평가와 고장 주입
+
+CARLA[43]는 센서 모델과 교통 제어를 제공하는 공개 시뮬레이터로 고장 주입
+연구의 표준 플랫폼이다. 자율주행 스택 대상 고장 주입으로는 베이지안
+최적화로 안전 위반을 효율 탐색하는 DriveFI[44], 오픈소스 주행 에이전트의
+레질리언스 평가[45], 시나리오 퍼징 AV-FUZZER[46]가 있고, 시나리오 기술
+언어 Scenic[47]이 환경 다양화를 지원한다. 이들은 "고장을 주입해 스택의
+취약점을 찾는" 평가 연구로, 주입된 고장을 스택이 스스로 감지·등급화하여
+대응을 선택하게 하는 본 연구와 방향이 반대이다(본 연구는 동일 주입
+기법을 검증 수단으로 사용한다). 본 연구는 CARLA 0.9.16과 Autoware(main)를
 연동하고, 케이스마다 시뮬레이터를 재기동하여 상태 누적을 차단하는 완전
 자동화 실험 하네스를 구축하였다(4장).
+
+### 2.7 기존 연구와의 비교
+
+**표 2-1. 기존 연구 계열과 본 연구의 비교**
+(○ 명시적 제공 / △ 부분·개념 수준 / × 미취급)
+
+| 연구 계열 (대표 문헌) | 고장 감지 | 연속 건강도 | 위험 연동 시간예산 | 잔여능력 평가 | 단계적 MRM 선택 | 폐루프 실증 |
+|---|:-:|:-:|:-:|:-:|:-:|:-:|
+| 표준·규제 (ISO 26262, R157 등)[1-7] | 요구만 | × | △ (FTTI 개념) | × | △ (MRC 유형) | × |
+| 고전 FDI·변화감지 [12-17] | ○ | △ (잔차 크기) | × | × | × | × |
+| 센서 열화 정량화 [20-29] | ○ (오프라인) | △ | × | × | × | × |
+| Fail-safe 궤적 계획 [30-32] | × (전제) | × | △ (온라인 검증) | × | △ (정지 궤적) | △ |
+| 폴백 전략 (Emzivat [33]) | △ | × | ○ (TTC 감속) | △ (감시능력 상실) | △ | × |
+| 능력·기술 그래프 [34-36] | △ | ○ (능력 수준) | × | ○ (개념) | △ (개념) | × |
+| 런타임 모니터 [37-39] | ○ (규칙 위반) | × | × | × | △ (안전 개입) | △ |
+| 순정 Autoware 진단·MRM [18] | △ (타임아웃·범위) | × (이진) | × | × | △ (정차 유형만) | ○ |
+| 고장 주입 평가 [43-47] | × (주입 측) | × | × | × | × | ○ |
+| **본 연구** | **○** (11종 실증) | **○** (신선도×품질 이원) | **○**¹ (min(τ,TTC)+최악가정) | **○** (위치·지각 신뢰) | **○** (대피/위임 밴드) | **○**² (1,313 유효) |
+
+¹ 동적 예산의 폐루프 주장은 "무해성 + 발동 실증"으로 한정한다(5.5절).
+² 단일 지도·경로·저속 ODD의 사례 연구이다(7장).
+
+표가 보이듯 각 축을 개별적으로 다룬 연구는 존재하나 — 감지는 FDI, 능력은
+skill graph, 위험 연동은 폴백 전략, 정지는 궤적 계획 — 여섯 축을 하나의
+시스템으로 통합하고 실제 스택 위 폐루프로 실증한 연구는 확인되지 않았다.
+본 연구의 위치는 개별 축의 새 알고리즘이 아니라 이 통합과 실증에 있다
+(1.3절의 신규성 서술과 일치).
 
 ---
 
@@ -871,30 +961,138 @@ margin))은 제안에 머문다. 수동 지도 주석(3.7절)은 확장성 제�
 
 ## 참고문헌
 
+**표준·규제**
+
 1. ISO 26262:2018, *Road vehicles — Functional safety*.
 2. ISO 21448:2022, *Road vehicles — Safety of the intended functionality*.
-3. SAE J3016, *Taxonomy and Definitions for Terms Related to Driving Automation Systems*.
-4. Robert Bosch GmbH, "Method and apparatus for determining fault tolerant
-   time interval (FTTI) of autonomous driving assistance system," U.S.
-   Patent US12347247B2.
-5. Y. Emzivat et al., "Dynamic Driving Task Fallback for an Automated
-   Driving System whose Ability to Monitor the Driving Environment has
-   been Compromised," *IEEE Intelligent Vehicles Symposium*, 2017.
-6. Autoware Foundation, autoware.universe: ring_outlier_filter,
-   blockage_diag, mrm_handler, goal_planner. https://autoware.org
-7. "Assessment of Noise of MEMS IMU Sensors of Different Grades for
-   GNSS/IMU Navigation," *Sensors*, 24(6), 2024.
-8. "GNSS Multipath Error Modeling for Automotive Applications," *Proc.
-   ION GNSS+*, 2018.
-9. "LiDAR Degradation Quantification for Autonomous Driving in Rain,"
-   *IEEE/RSJ IROS*, 2021.
-10. "Empirical Analysis of Autonomous Vehicle's LiDAR Detection
-    Performance Degradation for Actual Road Driving in Rain and Fog,"
+3. SAE J3016, *Taxonomy and Definitions for Terms Related to Driving
+   Automation Systems for On-Road Motor Vehicles*.
+4. UNECE Regulation No. 157, *Uniform provisions concerning the approval
+   of vehicles with regard to Automated Lane Keeping Systems (ALKS)*, 2021.
+5. UL 4600, *Standard for Safety for the Evaluation of Autonomous
+   Products*, 2020.
+6. ISO/TR 4804:2020, *Road vehicles — Safety and cybersecurity for
+   automated driving systems — Design, verification and validation*.
+7. AUTOSAR, *Specification of Watchdog Manager*, R23-11.
+
+**시간 예산·위험 지표**
+
+8. Robert Bosch GmbH, "Method and apparatus for determining fault
+   tolerant time interval (FTTI) of autonomous driving assistance
+   system," U.S. Patent US12347247B2.
+9. J. C. Hayward, "Near-miss determination through use of a scale of
+   danger," *Highway Research Record*, no. 384, 1972.
+10. M. M. Minderhoud and P. H. L. Bovy, "Extended time-to-collision
+    measures for road traffic safety assessment," *Accident Analysis &
+    Prevention*, 33(1), 2001.
+11. S. Shalev-Shwartz, S. Shammah, and A. Shashua, "On a formal model of
+    safe and scalable self-driving cars," arXiv:1708.06374, 2017.
+
+**고장 감지 이론**
+
+12. A. S. Willsky, "A survey of design methods for failure detection in
+    dynamic systems," *Automatica*, 12(6), 1976.
+13. R. Isermann, "Model-based fault-detection and diagnosis — status and
+    applications," *Annual Reviews in Control*, 29(1), 2005.
+14. R. Isermann, *Fault-Diagnosis Systems: An Introduction from Fault
+    Detection to Fault Tolerance*, Springer, 2006.
+15. Z. Gao, C. Cecati, and S. X. Ding, "A survey of fault diagnosis and
+    fault-tolerant techniques — Part I/II," *IEEE Transactions on
+    Industrial Electronics*, 62(6), 2015.
+16. E. S. Page, "Continuous inspection schemes," *Biometrika*, 41(1/2),
+    1954.
+17. M. Basseville and I. V. Nikiforov, *Detection of Abrupt Changes:
+    Theory and Application*, Prentice Hall, 1993.
+
+**센서별 감시·열화**
+
+18. Autoware Foundation, autoware.universe: ring_outlier_filter,
+    blockage_diag, mrm_handler, goal_planner. https://autoware.org
+19. R. B. Rusu and S. Cousins, "3D is here: Point Cloud Library (PCL),"
+    *IEEE ICRA*, 2011.
+20. M. Bijelic, T. Gruber, and W. Ritter, "A benchmark for lidar sensors
+    in fog: Is detection breaking down?" *IEEE Intelligent Vehicles
+    Symposium*, 2018.
+21. R. Heinzler, P. Schindler, J. Seekircher, W. Ritter, and W. Stork,
+    "Weather influence and classification with automotive lidar
+    sensors," *IEEE Intelligent Vehicles Symposium*, 2019.
+22. "LiDAR degradation quantification for autonomous driving in rain,"
+    *IEEE/RSJ IROS*, 2021.
+23. "Empirical analysis of autonomous vehicle's LiDAR detection
+    performance degradation for actual road driving in rain and fog,"
     *Sensors*, 23(6), 2023.
-11. A. Dosovitskiy et al., "CARLA: An Open Urban Driving Simulator,"
-    *Conference on Robot Learning (CoRL)*, 2017.
-12. D. Faconti, BehaviorTree.CPP / behaviortree_ros2.
-13. AUTOSAR, *Specification of Watchdog Manager*, R23-11.
+24. F. Secci and A. Ceccarelli, "On failures of RGB cameras and their
+    effects in autonomous driving applications," *IEEE ISSRE*, 2020.
+25. N. El-Sheimy, H. Hou, and X. Niu, "Analysis and modeling of inertial
+    sensors using Allan variance," *IEEE Transactions on Instrumentation
+    and Measurement*, 57(1), 2008.
+26. "Assessment of noise of MEMS IMU sensors of different grades for
+    GNSS/IMU navigation," *Sensors*, 24(6), 2024.
+27. "GNSS multipath error modeling for automotive applications," *Proc.
+    ION GNSS+*, 2018.
+28. N. Zhu, J. Marais, D. Bétaille, and M. Berbineau, "GNSS position
+    integrity in urban environments: A review of literature," *IEEE
+    Transactions on Intelligent Transportation Systems*, 19(9), 2018.
+29. T. G. R. Reid et al., "Localization requirements for autonomous
+    vehicles," *SAE International Journal of Connected and Automated
+    Vehicles*, 2(3), 2019.
+
+**폴백·MRM 계획**
+
+30. S. Magdici and M. Althoff, "Fail-safe motion planning of autonomous
+    vehicles," *IEEE ITSC*, 2016.
+31. L. Svensson et al., "Safe stop trajectory planning for highly
+    automated vehicles: An optimal control problem formulation," *IEEE
+    Intelligent Vehicles Symposium*, 2018.
+32. C. Pek, S. Manzinger, M. Koschi, and M. Althoff, "Using online
+    verification to prevent autonomous vehicles from causing accidents,"
+    *Nature Machine Intelligence*, 2, 2020.
+33. Y. Emzivat, J. Ibanez-Guzman, P. Martinet, and O. H. Roux, "Dynamic
+    driving task fallback for an automated driving system whose ability
+    to monitor the driving environment has been compromised," *IEEE
+    Intelligent Vehicles Symposium*, 2017.
+34. A. Reschka and M. Maurer, "Conditions for a safe state of automated
+    road vehicles," *it — Information Technology*, 57(4), 2015.
+
+**능력 기반 자기감시·런타임 모니터링**
+
+35. A. Reschka, G. Bagschik, S. Ulbrich, M. Nolte, and M. Maurer,
+    "Ability and skill graphs for system modeling, online monitoring,
+    and decision support for vehicle guidance systems," *IEEE
+    Intelligent Vehicles Symposium*, 2015.
+36. M. Nolte, G. Bagschik, I. Jatzkowski, T. Stolte, A. Reschka, and
+    M. Maurer, "Towards a skill- and ability-based development process
+    for self-aware automated road vehicles," *IEEE ITSC*, 2017.
+37. A. Kane, O. Chowdhury, A. Datta, and P. Koopman, "A case study on
+    runtime monitoring of an autonomous research vehicle (ARV) system,"
+    *Runtime Verification (RV)*, 2015.
+38. M. Machin, J. Guiochet, H. Waeselynck, J.-P. Blanquart, M. Roy, and
+    L. Masson, "SMOF: A safety monitoring framework for autonomous
+    systems," *IEEE Transactions on Systems, Man, and Cybernetics:
+    Systems*, 48(5), 2018.
+39. P. Koopman and M. Wagner, "Challenges in autonomous vehicle testing
+    and validation," *SAE International Journal of Transportation
+    Safety*, 4(1), 2016.
+40. M. Colledanchise and P. Ögren, *Behavior Trees in Robotics and AI:
+    An Introduction*, CRC Press, 2018.
+41. M. Iovino, E. Scukins, J. Styrud, P. Ögren, and C. Smith, "A survey
+    of behavior trees in robotics and AI," *Robotics and Autonomous
+    Systems*, 154, 2022.
+42. D. Faconti, BehaviorTree.CPP / behaviortree_ros2.
+
+**시뮬레이션 평가·고장 주입**
+
+43. A. Dosovitskiy, G. Ros, F. Codevilla, A. López, and V. Koltun,
+    "CARLA: An open urban driving simulator," *Conference on Robot
+    Learning (CoRL)*, 2017.
+44. S. Jha et al., "ML-based fault injection for autonomous vehicles: A
+    case for Bayesian fault injection," *IEEE/IFIP DSN*, 2019.
+45. S. H. Rubaiyat, Y. Qin, and H. Alemzadeh, "Experimental resilience
+    assessment of an open-source driving agent," *IEEE PRDC*, 2018.
+46. G. Li et al., "AV-FUZZER: Finding safety violations in autonomous
+    driving systems," *IEEE ISSRE*, 2020.
+47. D. J. Fremont et al., "Scenic: A language for scenario specification
+    and scene generation," *ACM PLDI*, 2019.
 
 ---
 
