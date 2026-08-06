@@ -211,10 +211,16 @@ hold)를 포함한다.
 양산 규제로서 MRM의 발동 조건과 거동(감속 정차, 위험 최소화)을 요구한다.
 UL 4600[5]과 ISO/TR 4804[6]는 자율주행 안전 사례(safety case)의 구성
 요소로 런타임 감시와 열화 대응을 명시한다. AUTOSAR Watchdog Manager[7]는
-100ms급 주기 감시(alive/deadline supervision)의 산업 관행을 보여준다.
-이들 표준은 "무엇이 요구되는가"를 정의하지만, 센서 고장의 종류·정도를
-연속적으로 추정해 대응을 구분 선택하는 구체적 방법은 제공하지 않는다 —
-본 연구가 다루는 지점이다.
+주기적 alive/deadline supervision 구조를 규정한다(주기는 구성 항목이다).
+특히 MRM을 직접 주제로 하는 **ISO 23793-1:2024**[51]는 MRM 유형의 분류
+프레임워크와 "상황에 따라 어떤 MRM 유형을 선택할 것인가"의 기본 원칙을
+규정하고, 최단순 유형인 직선 정차·차로 내 정차의 요구사항과 시험 절차를
+다룬다 — 갓길 정차(road shoulder stop)는 Part 2로 표준화가 진행 중이다.
+즉 "고장 상황에 맞는 MRM 유형 선택"은 표준화가 인정하는 문제이며, 본
+연구는 그 선택을 센서 건강도·잔여능력으로 구동하는 구체적 방법을
+제시한다. 이들 표준은 "무엇이 요구되는가"를 정의하지만, 센서 고장의
+종류·정도를 연속적으로 추정해 대응을 구분 선택하는 구체적 방법은
+제공하지 않는다 — 본 연구가 다루는 지점이다.
 
 ### 2.2 FTTI와 시간 예산의 도출
 
@@ -256,11 +262,12 @@ PCL[19]의 Statistical/Radius Outlier Removal은 공간 이웃 통계로 이상�
 블러, 노출 이상 등)를 분류하고 자율주행 지각에 미치는 영향을 분석했다 —
 본 연구의 카메라 고장 주입(cn, cf)은 이 분류의 대표 모드에 해당한다.
 
-**IMU.** Allan 분산 기반의 관성센서 노이즈 모델링[25]과 차량용 MEMS
-등급 평가[26]는 측정 백색노이즈(20Hz 기준 σ 0.04~0.09deg/s)보다 시간
-누적되는 바이어스 불안정성이 실제 위험임을 지적한다. 본 연구의 실험
-설계(백색노이즈 imn과 바이어스 imb의 분리)와 결과(백색노이즈
-미감지·무해, 바이어스 전용 채널 감지)는 이 문헌과 정합한다.
+**IMU.** Allan 분산 기반의 관성센서 노이즈 모델링[25]과 MEMS IMU 등급별
+노이즈 평가[26]는 측정 백색노이즈와 시간 누적되는 바이어스 불안정성을
+구분해 평가해야 하며, 항법 성능에 실질적 위협이 되는 것은 후자임을
+보여준다. 본 연구의 실험 설계(백색노이즈 imn과 바이어스 imb의 분리)와
+결과(백색노이즈 미감지·무해, 바이어스 전용 채널 감지)는 이 구분과
+정합한다.
 
 **GNSS·측위 무결성.** 도심 멀티패스 오차는 수 m에서 30m에 이르며[27],
 도심 GNSS 무결성 감시의 문헌 리뷰[28]와 자율주행 측위 요구사항 분석[29]이
@@ -281,10 +288,34 @@ planning)[30]하거나, 안전 정지를 최적제어 문제로 정식화[31]하
 자신이 불량할 때 마지막 관측 접근속도로 TTC 하한을 감쇠시키는 최악가정
 전파)는 이 관점의 연장선에 있다. Reschka와 Maurer[34]는 자동화 차량의
 "안전 상태"가 상황 의존적이며 차로 내 정차가 항상 안전하지 않음을
-지적했다 — 본 연구의 출발 문제의식과 같다. 오픈소스 스택 Autoware[18]는
-comfortable/emergency stop과 갓길 지향 pull_over 상태를 제공하나, 고장의
-종류·정도와 잔여 능력을 평가해 대피/정차를 구분 선택하는 감독 계층은
-제공하지 않는다(1.1절).
+지적했다 — 본 연구의 출발 문제의식과 같다.
+
+**센서 고장 전제형 대피·적응형 MRM — 가장 가까운 선행 연구.** Xue
+등[49]은 전방 센서 고장을 전제로, 주변 차량과의 충돌을 MPC 안전 제약으로
+회피하며 지정된 안전 주차 구역까지 차로를 이탈·정차하는 폴백을
+제안했고(CarSim/Simulink 검증), 후속 연구[50]는 미관측 영역에 가상
+차량(virtual vehicle)을 두고 최악 거동을 가정하는 적응형 MPC로 이를
+확장했다 — Emzivat의 ghost object[33], 본 연구의 fail-conservative TTC
+홀드와 같은 "보수적 가상 위험 모델링" 계보이다. 가장 가까운 연구는 Tang
+등[48]으로, 복수 센서 고장 조건에서 HAZOP 기반 위험 분석으로 위험 사건을
+식별하고, 가상 객체와 TTC·THW(차두시간) 평가로 MRM 행동(감속, 차로 유지
+정차, 갓길 지향 정차 등)을 실시간 적응 선택하며 MATLAB–CARLA 폐루프로
+검증했다. 본 연구와의 차이는 다음과 같다. (i) 이들은 **센서 고장 상태가
+주어졌다고 전제**하고 그 이후의 기동·선택을 다루는 반면, 본 연구는 센서
+데이터의 온라인 감시로 **고장의 발생·종류·심각도 추정부터** 수행한다
+(신선도×품질 연속 건강도, 11종 고장 실증). (ii) 선택 기준으로 이들은
+주변 교통과의 TTC/THW를 쓰는 반면, 본 연구는 위험 유예에 더해 **잔여
+지각·측위 능력**(위치 신뢰, 전방 지각)을 결합한다 — "시간이 있어도
+움직일 수 없는" 경우(GNSS 강 노이즈)의 구분은 후자 없이는 불가능하다
+(5.3절). (iii) 검증 규모·대상이 다르다: 대표 시나리오 중심의 MATLAB–CARLA
+대비, 본 연구는 실제 오픈소스 스택(Autoware) 위에서 1,313 유효 케이스의
+짝지은 반복과 무개입 위험시간 대조를 수행했다.
+
+오픈소스 스택 Autoware[18]는 comfortable/emergency stop과, goal_planner를
+통한 갓길 pull-over 경로 탐색 기능을 제공한다. 그러나 본 연구가 평가한
+커밋·실행 구성(4.1절)에서 센서 건강도와 잔여능력을 평가해 이들 대응을
+구분 발동하는 감독 계층은 존재하지 않았다 — 본 연구의 기여는 그 감독
+계층이다(1.1절).
 
 ### 2.5 능력 기반 자기감시와 런타임 모니터링
 
@@ -320,25 +351,32 @@ CARLA[43]는 센서 모델과 교통 제어를 제공하는 공개 시뮬레이�
 
 | 연구 계열 (대표 문헌) | 고장 감지 | 연속 건강도 | 위험 연동 시간예산 | 잔여능력 평가 | 단계적 MRM 선택 | 폐루프 실증 |
 |---|:-:|:-:|:-:|:-:|:-:|:-:|
-| 표준·규제 (ISO 26262, R157 등)[1-7] | 요구만 | × | △ (FTTI 개념) | × | △ (MRC 유형) | × |
+| 표준·규제 (ISO 26262, R157, ISO 23793-1 등)[1-7][51] | 요구만 | × | △ (FTTI 개념) | × | △ (MRM 유형 분류) | × |
 | 고전 FDI·변화감지 [12-17] | ○ | △ (잔차 크기) | × | × | × | × |
 | 센서 열화 정량화 [20-29] | ○ (오프라인) | △ | × | × | × | × |
 | Fail-safe 궤적 계획 [30-32] | × (전제) | × | △ (온라인 검증) | × | △ (정지 궤적) | △ |
 | 폴백 전략 (Emzivat [33]) | △ | × | ○ (TTC 감속) | △ (감시능력 상실) | △ | × |
-| 능력·기술 그래프 [34-36] | △ | ○ (능력 수준) | × | ○ (개념) | △ (개념) | × |
-| 런타임 모니터 [37-39] | ○ (규칙 위반) | × | × | × | △ (안전 개입) | △ |
+| 센서고장 전제형 대피·적응형 MRM (Xue [49][50]; Tang [48]) | × (고장 인지 전제) | × | ○ (TTC/THW) | △ (잔존 센서 활용) | ○ (적응형 선택) | △ (대표 시나리오) |
+| 안전상태·능력 기반 자기감시 [34-36] | △ | ○ (능력 수준) | × | ○ (개념) | △ (개념) | × |
+| 런타임 안전감시·검증 [37-39] | ○ (규칙 위반) | × | × | × | △ (안전 개입) | △ |
 | 순정 Autoware 진단·MRM [18] | △ (타임아웃·범위) | × (이진) | × | × | △ (정차 유형만) | ○ |
-| 고장 주입 평가 [43-47] | × (주입 측) | × | × | × | × | ○ |
-| **본 연구** | **○** (11종 실증) | **○** (신선도×품질 이원) | **○**¹ (min(τ,TTC)+최악가정) | **○** (위치·지각 신뢰) | **○** (대피/위임 밴드) | **○**² (1,313 유효) |
+| 시뮬레이션·시나리오·고장 주입 평가 [43-47] | × (주입 측) | × | × | × | × | ○ |
+| **본 연구** | **○** (11종 실증) | **○** (신선도×품질 이원) | **△/○**¹ (min(τ,TTC)+최악가정) | **○** (위치·지각 신뢰) | **○** (대피/위임 밴드) | **○**² (1,313 유효) |
 
-¹ 동적 예산의 폐루프 주장은 "무해성 + 발동 실증"으로 한정한다(5.5절).
+¹ 구현·발동은 실증했으나 폐루프 종단 이득은 미정량화 — 주장은 "무해성 +
+발동 실증"으로 한정한다(5.5절).
 ² 단일 지도·경로·저속 ODD의 사례 연구이다(7장).
 
-표가 보이듯 각 축을 개별적으로 다룬 연구는 존재하나 — 감지는 FDI, 능력은
-skill graph, 위험 연동은 폴백 전략, 정지는 궤적 계획 — 여섯 축을 하나의
-시스템으로 통합하고 실제 스택 위 폐루프로 실증한 연구는 확인되지 않았다.
-본 연구의 위치는 개별 축의 새 알고리즘이 아니라 이 통합과 실증에 있다
-(1.3절의 신규성 서술과 일치).
+표가 보이듯 각 축을 다룬 연구는 각기 존재한다 — 감지는 FDI, 능력은 skill
+graph, 위험 연동 폴백과 적응형 MRM 선택은 Emzivat·Xue·Tang 계열, 정지
+기동은 궤적 계획. 특히 Tang 등[48]은 TTC/THW 기반의 적응형 MRM 선택을
+폐루프로 보였다. 그러나 이들은 센서 고장 상태를 **전제**로 두며, 센서별
+신선도·품질을 온라인 연속 건강도로 추정하고, 고장별 위험 유예와 잔여
+지각·측위 능력을 함께 평가하여 대피와 즉시 정차를 구분하며, 이를 실제
+자율주행 스택(Autoware) 위에서 대규모 짝지은 반복과 무개입 위험시간
+대조로 검증한 연구는 확인하지 못하였다. 본 연구의 위치는 개별 축의 새
+알고리즘이 아니라 이 통합 — **감지부터 선택까지의 감독 계층** — 과 그
+실증에 있다(1.3절의 신규성 서술과 일치).
 
 ---
 
@@ -381,8 +419,9 @@ flowchart LR
 주기(라이다 20Hz, IMU 100Hz 등)로 데이터를 전부 수신·적산하며, 10Hz는
 적산된 증거를 "평가"하는 주기이다. 평가 주기가 기여하는 지연은 최대
 0.1초로, 측정된 종단 감지시간(0.75~2.8초)에 포함된 채로 고장별 위험
-예산을 충족한다(5.1절). 10Hz는 AUTOSAR Watchdog Manager의 감시 기준 주기
-관행(100ms) 및 Autoware 계획 계층의 판단 주기와도 정합한다.
+예산을 충족한다(5.1절). 100ms 평가 주기는 AUTOSAR Watchdog Manager의
+주기적 alive/deadline supervision 구조를 참고해 선택한 값이며, Autoware
+계획 계층의 판단 주기와도 정합한다.
 
 ### 3.2 센서 점수화
 
@@ -965,12 +1004,12 @@ margin))은 제안에 머문다. 수동 지도 주석(3.7절)은 확장성 제�
 
 1. ISO 26262:2018, *Road vehicles — Functional safety*.
 2. ISO 21448:2022, *Road vehicles — Safety of the intended functionality*.
-3. SAE J3016, *Taxonomy and Definitions for Terms Related to Driving
-   Automation Systems for On-Road Motor Vehicles*.
+3. SAE J3016_202104, *Taxonomy and Definitions for Terms Related to
+   Driving Automation Systems for On-Road Motor Vehicles*, 2021.
 4. UNECE Regulation No. 157, *Uniform provisions concerning the approval
    of vehicles with regard to Automated Lane Keeping Systems (ALKS)*, 2021.
 5. UL 4600, *Standard for Safety for the Evaluation of Autonomous
-   Products*, 2020.
+   Products*, 3rd ed., 2023.
 6. ISO/TR 4804:2020, *Road vehicles — Safety and cybersecurity for
    automated driving systems — Design, verification and validation*.
 7. AUTOSAR, *Specification of Watchdog Manager*, R23-11.
@@ -997,8 +1036,11 @@ margin))은 제안에 머문다. 수동 지도 주석(3.7절)은 확장성 제�
 14. R. Isermann, *Fault-Diagnosis Systems: An Introduction from Fault
     Detection to Fault Tolerance*, Springer, 2006.
 15. Z. Gao, C. Cecati, and S. X. Ding, "A survey of fault diagnosis and
-    fault-tolerant techniques — Part I/II," *IEEE Transactions on
-    Industrial Electronics*, 62(6), 2015.
+    fault-tolerant techniques — Part I: Fault diagnosis with model-based
+    and signal-based approaches," *IEEE Trans. Industrial Electronics*,
+    62(6), pp. 3757–3767, 2015; "— Part II: Fault diagnosis with
+    knowledge-based and hybrid/active approaches," 62(6), pp. 3768–3774,
+    2015. (제출본에서는 두 항목으로 분리)
 16. E. S. Page, "Continuous inspection schemes," *Biometrika*, 41(1/2),
     1954.
 17. M. Basseville and I. V. Nikiforov, *Detection of Abrupt Changes:
@@ -1006,8 +1048,9 @@ margin))은 제안에 머문다. 수동 지도 주석(3.7절)은 확장성 제�
 
 **센서별 감시·열화**
 
-18. Autoware Foundation, autoware.universe: ring_outlier_filter,
-    blockage_diag, mrm_handler, goal_planner. https://autoware.org
+18. Autoware Foundation, autoware.universe 패키지 문서: ring_outlier_filter,
+    blockage_diag, mrm_handler, goal_planner (autowarefoundation/autoware.universe,
+    평가 커밋은 부록 C에 명시). https://autowarefoundation.github.io/autoware.universe/
 19. R. B. Rusu and S. Cousins, "3D is here: Point Cloud Library (PCL),"
     *IEEE ICRA*, 2011.
 20. M. Bijelic, T. Gruber, and W. Ritter, "A benchmark for lidar sensors
@@ -1016,20 +1059,24 @@ margin))은 제안에 머문다. 수동 지도 주석(3.7절)은 확장성 제�
 21. R. Heinzler, P. Schindler, J. Seekircher, W. Ritter, and W. Stork,
     "Weather influence and classification with automotive lidar
     sensors," *IEEE Intelligent Vehicles Symposium*, 2019.
-22. "LiDAR degradation quantification for autonomous driving in rain,"
-    *IEEE/RSJ IROS*, 2021.
-23. "Empirical analysis of autonomous vehicle's LiDAR detection
-    performance degradation for actual road driving in rain and fog,"
-    *Sensors*, 23(6), 2023.
+22. C. Zhang et al., "LiDAR degradation quantification for autonomous
+    driving in rain," *IEEE/RSJ IROS*, 2021.
+    doi:10.1109/IROS51168.2021.9636694.
+23. J. Kim, B.-j. Park, and J. Kim, "Empirical analysis of autonomous
+    vehicle's LiDAR detection performance degradation for actual road
+    driving in rain and fog," *Sensors*, 23(6), 2972, 2023.
 24. F. Secci and A. Ceccarelli, "On failures of RGB cameras and their
     effects in autonomous driving applications," *IEEE ISSRE*, 2020.
 25. N. El-Sheimy, H. Hou, and X. Niu, "Analysis and modeling of inertial
     sensors using Allan variance," *IEEE Transactions on Instrumentation
     and Measurement*, 57(1), 2008.
-26. "Assessment of noise of MEMS IMU sensors of different grades for
-    GNSS/IMU navigation," *Sensors*, 24(6), 2024.
-27. "GNSS multipath error modeling for automotive applications," *Proc.
-    ION GNSS+*, 2018.
+26. V. Suvorkin, M. Garcia-Fernandez, G. González-Casado, M. Li, and
+    A. Rovira-Garcia, "Assessment of noise of MEMS IMU sensors of
+    different grades for GNSS/IMU navigation," *Sensors*, 24(6), 1953,
+    2024.
+27. S. Khanafseh, B. Kujur, M. Joerger, T. Walter, S. Pullen, J. Blanch
+    et al., "GNSS multipath error modeling for automotive applications,"
+    *Proc. ION GNSS+*, 2018.
 28. N. Zhu, J. Marais, D. Bétaille, and M. Berbineau, "GNSS position
     integrity in urban environments: A review of literature," *IEEE
     Transactions on Intelligent Transportation Systems*, 19(9), 2018.
@@ -1078,7 +1125,8 @@ margin))은 제안에 머문다. 수동 지도 주석(3.7절)은 확장성 제�
 41. M. Iovino, E. Scukins, J. Styrud, P. Ögren, and C. Smith, "A survey
     of behavior trees in robotics and AI," *Robotics and Autonomous
     Systems*, 154, 2022.
-42. D. Faconti, BehaviorTree.CPP / behaviortree_ros2.
+42. D. Faconti, BehaviorTree.CPP (v4) / behaviortree_ros2, 소스 저장소:
+    github.com/BehaviorTree/BehaviorTree.CPP (사용 버전은 부록 C에 명시).
 
 **시뮬레이션 평가·고장 주입**
 
@@ -1094,6 +1142,26 @@ margin))은 제안에 머문다. 수동 지도 주석(3.7절)은 확장성 제�
 47. D. J. Fremont et al., "Scenic: A language for scenario specification
     and scene generation," *ACM PLDI*, 2019.
 
+**센서 고장 전제형 대피·적응형 MRM (2.4절 최근접 선행)**
+
+48. J. Tang, C. Yang, and H. Nishimura, "Minimum risk maneuver strategy
+    for automated driving system under multiple conditions of sensor
+    failure," *Systems*, 14(1), 87, 2026.
+49. W. Xue, B. Yang, T. Kaizuka, and K. Nakano, "A fallback approach for
+    an automated vehicle encountering sensor failure in monitoring
+    environment," *IEEE Intelligent Vehicles Symposium*, 2018.
+    doi:10.1109/IVS.2018.8500392.
+50. W. Xue, B. Yang, T. Kaizuka, and K. Nakano, "An adaptive model
+    predictive approach for automated vehicle control in fallback
+    procedure based on virtual vehicle scheme," *Journal of Intelligent
+    and Connected Vehicles*, 2(2), pp. 67–77, 2019.
+51. ISO 23793-1:2024, *Intelligent transport systems — Minimal risk
+    manoeuvre (MRM) for automated driving — Part 1: Framework,
+    straight-stop and in-lane stop*. (Part 2: Road shoulder stop — 개발 중)
+
+> 서지 번호는 초고 기준이며, 제출본에서는 인용 순서로 재번호하고 전
+> 항목에 DOI·페이지를 통일 기입한다.
+
 ---
 
 ## 부록
@@ -1104,7 +1172,7 @@ margin))은 제안에 머문다. 수동 지도 주석(3.7절)은 확장성 제�
 |---|---|
 | τ_fresh 신선도 예산 | 850ms(실험) / 500ms(권고) |
 | FTTI 상한(총예산) | 1.5s (표 5-4 도출과 정합) |
-| BT/감독자 틱 | 100ms (AUTOSAR 감시주기 관행 정합) |
+| BT/감독자 틱 | 100ms (AUTOSAR 주기적 supervision 구조 참고) |
 | DEFER 확정(floor) | 5틱 = 0.5s |
 | 바이어스/침묵 지속 조건 | 3s / 1s+감쇠 |
 | Autoware 가용성 하트비트 | 0.5s / 진단 유닛 timeout 3.0s(CARLA 완화) |
