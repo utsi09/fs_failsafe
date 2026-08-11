@@ -22,6 +22,7 @@ cost(c) = w_time * eta
         + w_loc * eta * (1 - localization_score)
 """
 import math
+import os
 import time
 from collections import deque
 
@@ -35,7 +36,7 @@ from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Pose, Point, Quaternion, PoseWithCovarianceStamped
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from visualization_msgs.msg import Marker, MarkerArray
-from autoware_adapi_v1_msgs.msg import RouteState
+from autoware_adapi_v1_msgs.msg import RouteState, MrmState
 from autoware_adapi_v1_msgs.srv import SetRoutePoints
 
 from mrm_supervisor.map_model import MapModel
@@ -55,6 +56,8 @@ class Supervisor(Node):
         # Autoware mrm_handler (comfortable/emergency stop in lane). Used as
         # the comparison arm in the thesis experiments.
         self.declare_parameter("baseline", False)
+        # 데모 전용: 갓길 후보 제외(주차장 후보가 최선이 되게) — 캠페인 기본 off
+        self.declare_parameter("demo_no_shoulder", False)
         self.declare_parameter("upper_threshold", 0.7)
         self.declare_parameter("lower_threshold", 0.3)
         self.declare_parameter("min_loc_to_move", 0.5)
@@ -65,6 +68,17 @@ class Supervisor(Node):
         self.declare_parameter("w_sector", 500.0)
         self.declare_parameter("w_loc", 14.0)     # per second, scaled by (1 - loc)
         self.declare_parameter("arrive_dist", 4.0)
+        self.declare_parameter("shoulder_mrc_penalty", 175.0)  # MRC 질 서열 [비용]
+        # [Arm C 민감도 실험] env로 임계 오버라이드 — 미설정 시 완전 무동작.
+        # 러너 CLI에 파라미터 배관 없이 케이스별 스윕을 돌리기 위한 통로.
+        from rclpy.parameter import Parameter as _P
+        for _pname, _ev in (("min_loc_to_move", "MRM_MIN_LOC"),
+                            ("lower_threshold", "MRM_LOWER"),
+                            ("shoulder_mrc_penalty", "MRM_SHOULDER_PEN")):
+            _v = os.environ.get(_ev, "")
+            if _v:
+                self.set_parameters([_P(_pname, value=float(_v))])
+                self.get_logger().warn(f"[armC] {_pname} <- {_v} (env {_ev})")
         # a pull-over needs approach distance (decel + lateral shift);
         # candidates closer than this are infeasible, not "cheap"
         self.declare_parameter("min_approach_dist", 25.0)
@@ -144,6 +158,7 @@ class Supervisor(Node):
         self._stuck_since = None
         self._accept_time = None
         self._accept_pose = None
+        self._lowloc_ticks = 0  # consecutive band-confirmed ticks with loc < min_loc_to_move
 
         qos = QoSProfile(depth=1, durability=DurabilityPolicy.VOLATILE)
         self.create_subscription(DiagnosticArray, "/monitor/scores", self._scores_cb, qos)
@@ -180,6 +195,15 @@ class Supervisor(Node):
         # score alone does not reach (TL gate, localization too low to move).
         self.diag_pub = self.create_publisher(DiagnosticArray, "/diagnostics", 10)
 
+        # [HUD] ego 위를 따라다니는 상태·건강점수 텍스트 (RViz MarkerArray)
+        self.hud_pub = self.create_publisher(MarkerArray, "/mrm_supervisor/hud", qos)
+        # [패널 반영] 좌상단 AutowareStatePanel의 MRM State/Behavior에 우리
+        # 판정을 매핑해 표시 (mrm_handler와 동일 토픽 공유 — 우리 MRM 중일
+        # 때만 발행해 충돌 최소화)
+        # ADAPI 토픽은 latched 구독(transient_local) — volatile로 쏘면 QoS
+        # 불일치로 패널이 못 받음 (8/11 실측: Inactive 유지)
+        self.adapi_mrm_pub = self.create_publisher(MrmState, "/api/fail_safe/mrm_state", latched)
+        self.create_timer(0.5, self._publish_hud)
         self.create_timer(0.1, self._tick)
         self._publish_state()
 
@@ -400,6 +424,9 @@ class Supervisor(Node):
         # and localization faults (IMU/GNSS -> EKF wobble, caught by the
         # odometry-innovation loc_jump score) must both be able to fire MRM
         health = min(perception, cap_loc)
+        # HUD용 스냅샷: loc_jump/loc_meas는 내부 파생 점수라 scores에 없음 —
+        # "센서 0.9인데 왜 정지?"의 답(loc 붕괴)이 화면에 보이게 (8/11)
+        self._hud_health = (perception, cap_loc, health)
 
         if not self._armed:
             # require sustained health (3 s), not one blip: a transient 0.9
@@ -418,7 +445,9 @@ class Supervisor(Node):
         self._floor_ticks = self._floor_ticks + 1 if health <= lower else 0
 
         if self.state == "NORMAL":
-            if self._floor_ticks >= 5:
+            # 5틱(0.5s)은 gn 순간 스파이크(loc 0.13 실측)에 과민 — 종단 결정이므로
+            # MOVE 브랜치와 동일하게 2s 지속 요구 (gn-high의 지속 붕괴는 여전히 포착)
+            if self._floor_ticks >= 20:
                 self._transition("MRM_DEFER", f"health {health:.2f} below floor "
                                  f"(perception {perception:.2f}, loc {cap_loc:.2f})")
             elif health < upper:
@@ -432,19 +461,42 @@ class Supervisor(Node):
                         self._transition("MRM_DEFER",
                                          f"baseline: health {health:.2f}, stock MRM")
                     elif cap_loc < self.get_parameter("min_loc_to_move").value:
-                        self._transition("MRM_DEFER",
-                                         f"degraded but localization {cap_loc:.2f} too low to move")
+                        # gn 온셋에서 EMA가 설계점(≈0.58)보다 깊게 패이는 과도구간을
+                        # 순간 샘플링해 즉시 DEFER(8/10 실측 0.44) — 5 s 유지될 때만
+                        # 포기하고, 회복하면 MOVE로 진행
+                        self._lowloc_ticks += 1
+                        if self._lowloc_ticks == 1 or self._lowloc_ticks % 20 == 0:
+                            self.get_logger().warn(
+                                f"loc {cap_loc:.2f} below move floor "
+                                f"({self._lowloc_ticks}/50 ticks) — holding")
+                        if self._lowloc_ticks >= 50:
+                            self._transition("MRM_DEFER",
+                                             f"degraded but localization {cap_loc:.2f} "
+                                             f"too low to move for 5 s")
                     else:
                         self._enter_mrm_move(cap_loc)
             else:
                 # decay instead of reset so a borderline score oscillating
                 # around the threshold still accumulates
                 self._band_ticks = max(0, self._band_ticks - 1)
+                self._lowloc_ticks = 0
 
         elif self.state == "MRM_MOVE":
-            if self._floor_ticks >= 5:
+            # 5틱(0.5s)은 트래픽 회피 급제동+gn 노이즈의 innovation 스파이크에
+            # 과민(8/11 def 2건 실측: p 0.95+인데 loc 순간 0) — 2s 지속 요구
+            if self._floor_ticks >= 20:
                 self._transition("MRM_DEFER", f"health {health:.2f} collapsed en route")
                 return
+            # reject-loop 등으로 현재 타깃이 블랙리스트됐으면 즉시 재선택
+            if self._chosen is not None and self._chosen.name in self._blacklist:
+                best = self._select_candidate(cap_loc)
+                if best is None:
+                    self._transition("MRM_DEFER", "no viable candidate left — stock MRM")
+                    return
+                self._chosen = best
+                self._goal_sent = False
+                self._publish_state()
+                self.get_logger().warn(f"fallback target: {best.name}")
             # route-change watchdog: near its own goal Autoware's goal_planner
             # takes over and the change service can go unanswered — the car
             # then silently finishes the OLD route. Retry, then hand over to
@@ -460,7 +512,9 @@ class Supervisor(Node):
                     self._transition("MRM_DEFER", "route change unanswered — stock MRM")
                     return
             if not self._goal_sent:
-                self._send_goal()
+                now_s = self.get_clock().now().nanoseconds * 1e-9
+                if now_s >= getattr(self, "_reject_until", 0.0):
+                    self._send_goal()
             elif self._chosen and self.pose:
                 d = math.dist(self.pose, (self._chosen.x, self._chosen.y))
                 # decompose into along-shoulder / across-shoulder: a plain
@@ -474,6 +528,11 @@ class Supervisor(Node):
                 on_shoulder = (abs(lon) < self.get_parameter("arrive_dist").value
                                and abs(lat) < 1.5)
                 arrived = on_shoulder or self.route_state == RouteState.ARRIVED
+                # 주차장: mission 라우트가 골 수정으로 링/진입로에서 조기 ARRIVED를
+                # 쏴서 4.3m 앞에서 PARKED 처리, freespace 기동이 잘림(8/10 실측)
+                # — 골 3m 이내 실도달까지 판정 보류
+                if self._chosen.kind == "parking_lot" and d > 3.0:
+                    arrived = False
                 if arrived and self.speed < 0.2:
                     self._transition("MRM_PARKED",
                                      f"stopped at {self._chosen.name} "
@@ -485,8 +544,12 @@ class Supervisor(Node):
                 # detector. If 90 s after accept we have moved <25 m, the
                 # exposure outweighs the pull-over benefit: try the next
                 # candidate (exhausted -> DEFER).
+                # 주차장 후보는 제외: 시나리오 전환+costmap+A*+기동에 60~120 s가
+                # 걸려 90 s/25 m 기준이 기동 중 골을 뺏는다(8/10 밤 39건 전패 원인,
+                # 45 s stall 타이머와 동일한 실수) — 주차장은 180 s stall 검출이 담당
                 if (self._goal_accepted and self._accept_time is not None
                         and self._accept_pose is not None
+                        and self._chosen.kind != "parking_lot"
                         and (self.get_clock().now() - self._accept_time).nanoseconds > 90e9
                         and math.dist(self.pose, self._accept_pose) < 25.0):
                     self._blacklist.add(self._chosen.name)
@@ -509,16 +572,72 @@ class Supervisor(Node):
                 # or overshot shoulder): ego stalls without ever reaching the
                 # shoulder. Blacklist that candidate and fall back to the next.
                 # 45 s > a full Town07 red phase, so light waits don't trigger.
+                # [주차장 데모] 폴리곤 안 정차 순간 골 1회 재전송(넛지):
+                # 새 route uuid -> scenario EMPTY 리셋 -> 위치 재판정 -> Parking 전환.
+                # 모든 성공 사례의 실제 전환 메커니즘(실측).
+                # _moved_since_goal 가드: fault 시점 ego가 이미 폴리곤 안(신호 대기
+                # 등)이면 출발 전에 넛지 3발이 13 s 만에 소진되며 route 리셋만
+                # 반복(8/10 실측) — "주행해서 lot 도착 후 정차" 시에만 발사
+                if (self._goal_accepted and self.speed < 0.2
+                        and getattr(self, "_moved_since_goal", False)
+                        and self._chosen is not None
+                        and self._chosen.kind == "parking_lot"
+                        and getattr(self, "_nudge_count", 0) < 3
+                        and self._ego_in_lot_polygon()):
+                    now_s = self.get_clock().now().nanoseconds * 1e-9
+                    if now_s - getattr(self, "_last_nudge_s", 0.0) > 8.0:
+                        self._nudge_count = getattr(self, "_nudge_count", 0) + 1
+                        self._last_nudge_s = now_s
+                        self._goal_sent = False
+                        self._send_goal()
+                        self.get_logger().warn(
+                            f"parking nudge #{self._nudge_count}: goal re-sent at in-lot stop")
                 if self._goal_accepted and self.speed < 0.2:
                     now = self.get_clock().now()
-                    if self._stuck_since is None:
+                    if not getattr(self, "_moved_since_goal", False):
+                        # 골 수락 후 미출발: 보통은 engage 지연이지만, 교차로에서
+                        # 리루트가 오면 behavior의 out-of-route 래치(마진 없는
+                        # 폴리곤 검사 + gn 노이즈)로 영구 웨지가 됨(8/11 실측
+                        # 3건: (-2,-17),(-101,33),(-123,106) 전부 교차로).
+                        # 20s 미출발 시 골 재전송으로 route/모듈 재초기화(최대 3회)
+                        if self._wedge_since is None:
+                            self._wedge_since = now
+                        elif ((now - self._wedge_since).nanoseconds > 20e9
+                              and self._wedge_retries < 3):
+                            self._wedge_retries += 1
+                            self._wedge_since = None
+                            self._goal_sent = False
+                            self._goal_accepted = False
+                            self.get_logger().warn(
+                                f"departure wedge retry #{self._wedge_retries}: "
+                                f"re-sending goal to {self._chosen.name}")
+                    elif self._stuck_since is None:
                         self._stuck_since = now
-                    elif (now - self._stuck_since).nanoseconds > 45e9:
+                    elif (now - self._stuck_since).nanoseconds > (
+                            180e9 if self._chosen.kind == "parking_lot" else 45e9):
+                        # 주차장: Parking 전환(정차 5s)+costmap+A*+기동에 60~120s 소요 —
+                        # 45s 도약이 기동 중 골을 뺏어 DEFER시키는 것을 실측 후 복원
+                        # 주차장 후보는 도착 후 주차 시나리오 전환·freespace 기동에
+                        # 60~90초가 걸린다 — 45초 타이머가 기동 중 목표를 도약시켜
+                        # freespace가 격자 밖 목표를 받는 기각 루프를 만들었다(실측)
+                        if (self._chosen.kind == "parking_lot"
+                                and getattr(self, "_stall_retries", 0) < 2):
+                            # 트래픽이 freespace 기동을 막아 생기는 일시 정체는
+                            # 후보 폐기 사유가 아님(8/10 def/agg 4건 실측) — 같은
+                            # 골 재전송으로 2회까지 재시도 후에만 폐기
+                            self._stall_retries = getattr(self, "_stall_retries", 0) + 1
+                            self._stuck_since = None
+                            self._goal_sent = False
+                            self.get_logger().warn(
+                                f"parking stall retry #{self._stall_retries}: "
+                                f"re-sending goal to {self._chosen.name}")
+                            return
                         self._blacklist.add(self._chosen.name)
                         self.get_logger().error(
-                            f"stalled 45 s off-shoulder near {self._chosen.name} "
+                            f"stalled off-shoulder near {self._chosen.name} "
                             f"(d={d:.0f}m, lat={lat:.1f}m) — trying next candidate")
                         self._stuck_since = None
+                        self._moved_since_goal = False
                         self._goal_sent = False
                         self._goal_accepted = False
                         best = self._select_candidate(cap_loc)
@@ -531,6 +650,9 @@ class Supervisor(Node):
                         self.get_logger().warn(f"fallback target: {best.name}")
                 else:
                     self._stuck_since = None
+                    self._wedge_since = None
+                    if self._goal_accepted and self.speed >= 0.2:
+                        self._moved_since_goal = True
 
         # MRM_PARKED / MRM_DEFER are terminal for this run
 
@@ -549,6 +671,9 @@ class Supervisor(Node):
         self._select_failures = 0
         self._chosen = best
         self._goal_sent = False
+        self._stall_retries = 0   # 타깃별 stall 재시도 카운터 리셋
+        self._wedge_since = None
+        self._wedge_retries = 0   # 출발 웨지(out-of-route 래치) 재시도 리셋
         self._transition("MRM_MOVE", f"target {best.name}")
 
     def _tl_observable(self):
@@ -573,6 +698,9 @@ class Supervisor(Node):
         src = self.map.nearest_road_lanelet(*self.pose)
         self.get_logger().info(f"selecting from pose ({self.pose[0]:.1f}, {self.pose[1]:.1f}), "
                                f"current lanelet {src}")
+        # 교차로 내부 lanelet은 그래프 출구가 없어 전 후보 INF가 날 수 있음 —
+        # 최근접 3개 중 라우팅 가능한 소스로 폴백 (8/11 agg 실측)
+        src_candidates = self.map.nearest_road_lanelets(*self.pose, k=3)
         cap_tl = self._score("capability/traffic_light")
         w_t = self.get_parameter("w_time").value
         tl_wait = self.get_parameter("tl_wait_s").value
@@ -581,10 +709,22 @@ class Supervisor(Node):
         w_loc = self.get_parameter("w_loc").value
 
         best, best_cost, evaluated = None, float("inf"), []
+        no_shoulder = self.get_parameter("demo_no_shoulder").value
+        # 검증용: MRM_FORCE_TARGET=parking_1003001 식으로 특정 후보 강제
+        # (lot별 개별 검증 — 비용 순위에서 밀리는 lot도 지정 실험 가능)
+        force = os.environ.get("MRM_FORCE_TARGET", "")
         for c in self.candidates:
+            if force and c.name != force:
+                continue
             if c.name in self._blacklist:
                 continue     # goal_planner already failed to park there
-            r = self.map.route(src, c.target_lanelet)
+            if no_shoulder and c.kind == "shoulder":
+                continue     # 데모: 주차장 후보만 평가
+            r = None
+            for s in src_candidates:
+                r = self.map.route(s, c.target_lanelet)
+                if r is not None:
+                    break
             if r is None:
                 evaluated.append((c, float("inf"), "unreachable"))
                 continue
@@ -606,6 +746,13 @@ class Supervisor(Node):
                     + w_tl * n_tl * g
                     + w_sec * sector_pen
                     + w_loc * eta * (1.0 - cap_loc))
+            # MRC 질 서열(주차장 > 노측)을 비용에 인코딩: 노측 정차는 차로
+            # 부분 점유가 남는 열등 MRC이므로 고정 페널티. 값 175 ≈ 저하 주행
+            # 25초 상당 — 주차장이 그 이내 추가 비용이면 주차장을 선호.
+            # (경로 실측 gap +80~+270에서 혼합 선택이 나오도록 보정, 8/10)
+            # no-shoulder 모드에선 갓길이 아예 후보 제외라 결과 불변(Arm B 무영향).
+            if c.kind == "shoulder":
+                cost += self.get_parameter("shoulder_mrc_penalty").value
             evaluated.append((c, cost,
                               f"len {length:.0f}m eta {eta:.0f}s tl {n_tl} sec {sector_pen:.2f}"))
             if cost < best_cost:
@@ -616,6 +763,26 @@ class Supervisor(Node):
                                    f"{'INF' if math.isinf(cost) else f'{cost:.0f}'} ({why})")
         self._publish_markers(evaluated, best)
         return best
+
+    def _ego_in_lot_polygon(self):
+        """현재 타깃 주차장 폴리곤 안에 ego가 있는지 (ray casting)."""
+        if self.pose is None or self._chosen is None:
+            return False
+        wid = self._chosen.name.rsplit("_", 1)[-1]
+        pts = self.map.parking_lots.get(wid)
+        if not pts:
+            return False
+        x, y = self.pose
+        inside = False
+        n = len(pts)
+        for i in range(n):
+            x1, y1 = pts[i]
+            x2, y2 = pts[(i + 1) % n]
+            if (y1 > y) != (y2 > y):
+                xi = x1 + (y - y1) * (x2 - x1) / (y2 - y1)
+                if xi > x:
+                    inside = not inside
+        return inside
 
     def _send_goal(self):
         if not self.route_cli.service_is_ready():
@@ -640,11 +807,37 @@ class Supervisor(Node):
         try:
             res = future.result()
             if not res.status.success:
-                self.get_logger().error(f"route change rejected: {res.status.message} — retrying")
-                self._goal_sent = False
+                in_lot = (self._chosen is not None
+                          and self._chosen.kind == "parking_lot"
+                          and self._ego_in_lot_polygon())
+                if "not in lane following" in res.status.message and in_lot:
+                    # lot 폴리곤 안에서의 리루트 거부 = Parking 기동 진행 중 —
+                    # 재전송하면 75ms 스팸 루프(8/10 실측). 조용히 대기.
+                    self._goal_sent = True
+                    self.get_logger().warn(
+                        "route change rejected (parking underway) — standing by")
+                else:
+                    # 주행 중 거부: 옛 경로로 lot을 지나치는 함정 — 재시도하되
+                    # 2s 쿨다운(스팸 방지). 거부는 '응답'이므로 unanswered 아님.
+                    # lot 밖 Parking 래치(goal 지나침)면 거부가 무한 반복됨(8/11
+                    # 0359 실측) — 연속 15회(~30s)면 이 타깃 폐기, 다음 후보로
+                    self._reject_streak = getattr(self, "_reject_streak", 0) + 1
+                    self.get_logger().error(
+                        f"route change rejected: {res.status.message} — retry in 2 s "
+                        f"(streak {self._reject_streak})")
+                    self._goal_sent = False
+                    self._reject_until = self.get_clock().now().nanoseconds * 1e-9 + 2.0
+                    if self._reject_streak >= 15 and self._chosen is not None:
+                        self._blacklist.add(self._chosen.name)
+                        self._reject_streak = 0
+                        self.get_logger().error(
+                            f"reject loop: blacklisting {self._chosen.name}, reselecting")
+                        self._goal_accepted = False
+                        self._moved_since_goal = False
             else:
                 self._goal_accepted = True
                 self._noresp = 0
+                self._reject_streak = 0
                 self._accept_time = self.get_clock().now()
                 self._accept_pose = self.pose
                 self.get_logger().warn("route change ACCEPTED by Autoware")
@@ -661,6 +854,43 @@ class Supervisor(Node):
             # the 10 Hz periodic publish in _tick) so the measured detection
             # latency is the real one, not detection + publish-cycle jitter
             self._publish_state()
+
+    def _publish_hud(self):
+        # 상태별 색 + 점수 블록. 고장 부위는 최저 점수 항목으로 표시.
+        colors = {"NORMAL": (0.2, 1.0, 0.2), "MRM_MOVE": (1.0, 0.8, 0.1),
+                  "MRM_PARKED": (0.2, 0.6, 1.0), "MRM_DEFER": (1.0, 0.2, 0.2)}
+        r, g, b = colors.get(self.state, (1.0, 1.0, 1.0))
+        # 표시 규칙(사용자 지시): 상태 + 현재 건강도는 항상, 고장 시엔
+        # 문제 센서(원인)와 그 점수만 추가 — 전체 점수 나열은 안 함
+        lines = [f"[{self.state}]" + (f" -> {self._chosen.name}" if self._chosen else "")]
+        bad = [(k.split("/")[-1], v) for k, v in self.scores.items() if v < 0.5]
+        if getattr(self, "_hud_health", None):
+            p, l, h = self._hud_health
+            lines.append(f"health {h:.2f} (percep {p:.2f} / loc {l:.2f})")
+            if l < 0.5:
+                bad.append(("localization(EKF)", l))
+        for name, v in sorted(bad, key=lambda kv: kv[1])[:4]:
+            lines.append(f"FAULT {name}: {v:.2f}")
+        m = Marker()
+        m.header.frame_id = "base_link"
+        m.header.stamp = self.get_clock().now().to_msg()
+        m.ns = "mrm_hud"; m.id = 0
+        m.type = Marker.TEXT_VIEW_FACING; m.action = Marker.ADD
+        m.pose.position.z = 3.5
+        m.scale.z = 0.9
+        m.color.r, m.color.g, m.color.b, m.color.a = r, g, b, 0.95
+        m.text = "\n".join(lines)
+        arr = MarkerArray(); arr.markers.append(m)
+        self.hud_pub.publish(arr)
+        # 좌상단 패널 반영: 우리 MRM 활성 구간에만 ADAPI mrm_state 발행
+        if self.state != "NORMAL":
+            ms = MrmState()
+            ms.stamp = self.get_clock().now().to_msg()
+            ms.state = (MrmState.MRM_SUCCEEDED if self.state == "MRM_PARKED"
+                        else MrmState.MRM_OPERATING)
+            ms.behavior = (MrmState.PULL_OVER if self.state in ("MRM_MOVE", "MRM_PARKED")
+                           else MrmState.COMFORTABLE_STOP)
+            self.adapi_mrm_pub.publish(ms)
 
     def _publish_state(self):
         detail = f":{self._chosen.name}" if self._chosen else ""

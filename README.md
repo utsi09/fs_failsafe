@@ -1,8 +1,19 @@
 # fs_failsafe — BT 기반 동적 FTTI 센서 모니터링 + 점수 기반 MRM Supervisor
 
 Autoware + CARLA(AWCL) 환경에서 센서 고장을 실시간 감지하고,
-고장 심각도에 따라 **갓길 대피(MRM_MOVE)** 또는 **순정 Autoware MRM 위임(MRM_DEFER)** 을
-수행하는 failsafe 시스템과 자동 반복실험 프레임워크.
+고장 심각도에 따라 **주차장 대피 → 노측(road-edge) 대피 → 제자리 정지(DEFER)** 의
+MRC 질 서열로 최소위험기동을 수행하는 failsafe 시스템과 자동 반복실험 프레임워크.
+
+## v3 (2026-08-11): 주차장 MRM
+
+- Town07 주차 후보 4곳(남쪽 헛간·북쪽 14칸 라인·로터리 섬·북서 패드) 등록,
+  **후진주차 포함 전 지점 PARKED_SUCCESS 실측** — 성공 영상: [`docs/videos/`](docs/videos/)
+- 후진주차를 막던 결함 사슬 15건 규명·수정 (에이전트 후진 가속 부호,
+  supervisor 타이머 위계, lanelet 그래프 위상, 시뮬레이터 판정 조항 등)
+  — 전체 목록·실측 근거: [`docs/v3_parking_notes.md`](docs/v3_parking_notes.md)
+- 주 지표: **주차 전환 후 성공률** (전환 전 제자리 DEFER는 안전 동작으로 별도 집계)
+- 트래픽 밀도 차원(none/def/agg + low/high), 자이로 램프 드리프트(imd) 고장,
+  RViz 상태·건강 HUD, 민감도 스윕(Arm C) + CUSUM 오프라인 리플레이 추가
 
 ## 구조
 

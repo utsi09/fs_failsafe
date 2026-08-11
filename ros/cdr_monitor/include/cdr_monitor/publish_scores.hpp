@@ -181,9 +181,17 @@ public:
         // treats anything but OK as unavailable (level()==OK check), so a
         // WARN here would trigger the stock MRM in exactly the band the
         // supervisor is supposed to own. OK above the floor, ERROR below.
-        agg.level = perception > 0.3 ? diagnostic_msgs::msg::DiagnosticStatus::OK
-                                     : diagnostic_msgs::msg::DiagnosticStatus::ERROR;
-        if (warmup_done_) apply_latch(agg, perception, now_ns, true);
+        // [우측 실주차장 데모 임시] CDR_DEMO_NO_ERROR=1: gn 노이즈가 순간적으로
+        // 0.3을 스치며 Autoware MRM을 격발해 주차 기동을 끊는 것 방지 —
+        // supervisor DEFER 핸드오버(defer_request)는 그대로 살아있음
+        static const bool demo_no_error = []() {
+            const char* e = std::getenv("CDR_DEMO_NO_ERROR");
+            return e && e[0] == '1';
+        }();
+        agg.level = (demo_no_error || perception > 0.3)
+                        ? diagnostic_msgs::msg::DiagnosticStatus::OK
+                        : diagnostic_msgs::msg::DiagnosticStatus::ERROR;
+        if (!demo_no_error && warmup_done_) apply_latch(agg, perception, now_ns, true);
         else { agg.level = diagnostic_msgs::msg::DiagnosticStatus::OK;
                agg.message = "warmup"; }
         diag.status.push_back(agg);

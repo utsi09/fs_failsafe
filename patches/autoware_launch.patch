@@ -44,6 +44,19 @@ index a1ae147..9d976c8 100644
 +    check_footprint_inside_lanes: false # allow goal footprint overhanging narrow shoulders (was true)
      allow_reroute_in_autonomous_mode: true
      goal_lanelet_transparency: 0.05 # Sets the transparency of the goal lanelet marker in RViz. Higher value makes the marker more visible.
+diff --git a/autoware_launch/config/planning/scenario_planning/common/costmap_generator.param.yaml b/autoware_launch/config/planning/scenario_planning/common/costmap_generator.param.yaml
+index e31886c..56caebb 100644
+--- a/autoware_launch/config/planning/scenario_planning/common/costmap_generator.param.yaml
++++ b/autoware_launch/config/planning/scenario_planning/common/costmap_generator.param.yaml
+@@ -13,7 +13,7 @@
+     grid_position_x: 0.0
+     grid_position_y: 0.0
+     maximum_lidar_height_thres: 2.5  # [m] when use_points is true, ignore points with a z value above this (in the vehicle_frame)
+-    minimum_lidar_height_thres: 0.0  # [m] when use_points is true, ignore points with a z value bellow this (in the vehicle_frame)
++    minimum_lidar_height_thres: 0.3  # [주차 데모: 연석 무시, 원본 0.0] [m] when use_points is true, ignore points with a z value bellow this (in the vehicle_frame)
+     use_wayarea: true
+     use_parkinglot: true
+     use_objects: true
 diff --git a/autoware_launch/config/planning/scenario_planning/lane_driving/behavior_planning/behavior_path_planner/goal_planner/goal_planner.param.yaml b/autoware_launch/config/planning/scenario_planning/lane_driving/behavior_planning/behavior_path_planner/goal_planner/goal_planner.param.yaml
 index fcb53df..8823aed 100644
 --- a/autoware_launch/config/planning/scenario_planning/lane_driving/behavior_planning/behavior_path_planner/goal_planner/goal_planner.param.yaml
@@ -66,11 +79,145 @@ index fcb53df..8823aed 100644
          high_curvature_threshold: 0.1
          bus_stop_area:
            use_bus_stop_area: false
+diff --git a/autoware_launch/config/planning/scenario_planning/parking/freespace_planner/freespace_planner.param.yaml b/autoware_launch/config/planning/scenario_planning/parking/freespace_planner/freespace_planner.param.yaml
+index 1d7048e..e745e41 100644
+--- a/autoware_launch/config/planning/scenario_planning/parking/freespace_planner/freespace_planner.param.yaml
++++ b/autoware_launch/config/planning/scenario_planning/parking/freespace_planner/freespace_planner.param.yaml
+@@ -6,10 +6,10 @@
+     update_rate: 10.0
+     th_arrived_distance_m: 0.5
+     th_stopped_time_sec: 1.0
+-    th_stopped_velocity_mps: 0.01
++    th_stopped_velocity_mps: 0.2  # [우측 실주차장 데모 임시 — 원본 0.01: gn 노이즈로 정지 판정 불가]
+     th_course_out_distance_m: 1.0
+     th_obstacle_time_sec: 1.0
+-    vehicle_shape_margin_m: 0.4
++    vehicle_shape_margin_m: 0.15  # [우측 실주차장 데모 임시 — 원본 0.4]
+     replan_when_obstacle_found: true
+     replan_when_course_out: true
+ 
+diff --git a/autoware_launch/config/planning/scenario_planning/parking/freespace_planner/freespace_planner.param.yaml.bak_demo b/autoware_launch/config/planning/scenario_planning/parking/freespace_planner/freespace_planner.param.yaml.bak_demo
+new file mode 100644
+index 0000000..1d7048e
+--- /dev/null
++++ b/autoware_launch/config/planning/scenario_planning/parking/freespace_planner/freespace_planner.param.yaml.bak_demo
+@@ -0,0 +1,52 @@
++/**:
++  ros__parameters:
++    # -- Node Configurations --
++    planning_algorithm: "astar"
++    waypoints_velocity: 5.0
++    update_rate: 10.0
++    th_arrived_distance_m: 0.5
++    th_stopped_time_sec: 1.0
++    th_stopped_velocity_mps: 0.01
++    th_course_out_distance_m: 1.0
++    th_obstacle_time_sec: 1.0
++    vehicle_shape_margin_m: 0.4
++    replan_when_obstacle_found: true
++    replan_when_course_out: true
++
++    # -- Configurations common to the all planners --
++    # base configs
++    time_limit: 30000.0
++    # robot configs # TODO replace by vehicle_info
++    max_turning_ratio: 0.5 # ratio of actual turning limit of vehicle
++    turning_steps: 1
++    # search configs
++    theta_size: 120
++    angle_goal_range: 6.0
++    lateral_goal_range: 0.5
++    longitudinal_goal_range: 1.0
++    curve_weight: 0.5
++    reverse_weight: 0.7
++    direction_change_weight: 2.0
++    # costmap configs
++    obstacle_threshold: 100
++
++    # -- A* search Configurations --
++    astar:
++      search_method: "forward"  # options: forward, backward
++      only_behind_solutions: false
++      use_back: true
++      adapt_expansion_distance: true
++      expansion_distance: 0.5
++      near_goal_distance: 3.0
++      distance_heuristic_weight: 2.0
++      smoothness_weight: 0.5
++      obstacle_distance_weight: 1.75
++      goal_lat_distance_weight: 5.0
++
++    # -- RRT* search Configurations --
++    rrtstar:
++      enable_update: true
++      use_informed_sampling: true
++      max_planning_time: 150.0
++      neighbor_radius: 8.0
++      margin: 0.1
+diff --git a/autoware_launch/config/system/component_state_monitor/topics.yaml b/autoware_launch/config/system/component_state_monitor/topics.yaml
+index 2a83b2a..0f85355 100644
+--- a/autoware_launch/config/system/component_state_monitor/topics.yaml
++++ b/autoware_launch/config/system/component_state_monitor/topics.yaml
+@@ -60,8 +60,8 @@
+     best_effort: true
+     transient_local: false
+     warn_rate: 5.0
+-    error_rate: 1.0
+-    timeout: 1.0
++    error_rate: 0.05  # [주차 데모 임시 — 원본 1.0] 부하 스톨 1s 갭에 자율모드
++    timeout: 60.0     # 사망(8/11 재현 실측). 제어·계획 모니터와 동일 완화. 원복 필수
+ 
+ - module: perception
+   mode: [online, logging_simulation, planning_simulation]
+@@ -112,8 +112,8 @@
+     best_effort: false
+     transient_local: false
+     warn_rate: 5.0
+-    error_rate: 1.0
+-    timeout: 1.0
++    error_rate: 0.05  # [우측 실주차장 데모 임시 — 원본 1.0]
++    timeout: 60.0     # [원본 1.0]
+ 
+ - module: control
+   mode: [online, logging_simulation, planning_simulation]
+@@ -125,8 +125,8 @@
+     best_effort: false
+     transient_local: false
+     warn_rate: 5.0
+-    error_rate: 1.0
+-    timeout: 1.0
++    error_rate: 0.05  # [우측 실주차장 데모 임시 — 원본 1.0]
++    timeout: 60.0     # [원본 1.0]
+ 
+ - module: control
+   mode: [online, logging_simulation, planning_simulation]
+@@ -138,8 +138,8 @@
+     best_effort: false
+     transient_local: false
+     warn_rate: 5.0
+-    error_rate: 1.0
+-    timeout: 1.0
++    error_rate: 0.05  # [우측 실주차장 데모 임시 — 원본 1.0]
++    timeout: 60.0     # [원본 1.0]
+ 
+ - module: vehicle
+   mode: [online, logging_simulation, planning_simulation]
 diff --git a/autoware_launch/config/system/diagnostics/autoware-carla.yaml b/autoware_launch/config/system/diagnostics/autoware-carla.yaml
-index 4f05e99..84a1ff6 100644
+index 4f05e99..aabecb6 100644
 --- a/autoware_launch/config/system/diagnostics/autoware-carla.yaml
 +++ b/autoware_launch/config/system/diagnostics/autoware-carla.yaml
-@@ -45,6 +45,8 @@ units:
+@@ -38,13 +38,18 @@ units:
+     type: and
+     list:
+       - { type: link, link: /autoware/map }
+-      - { type: link, link: /autoware/localization }
++      # [우측 실주차장 데모 임시] gn 노이즈로 요동치는 localization 진단이
++      # Autoware MRM을 상시 래치시켜 주차 기동을 봉쇄 — 데모 동안 제외.
++      # supervisor DEFER 핸드오버(cdr/supervisor_defer)는 유지. 원복 필수.
++      # - { type: link, link: /autoware/localization }
+       - { type: link, link: /autoware/planning }
+       - { type: link, link: /autoware/perception }
+       - { type: link, link: /autoware/control }
        - { type: link, link: /autoware/vehicle }
        - { type: link, link: /autoware/system }
        - { type: link, link: /adapi/mrm_request/delegate }
@@ -79,7 +226,7 @@ index 4f05e99..84a1ff6 100644
  
    - path: /autoware/modes/pull_over
      type: and
-@@ -123,6 +125,26 @@ units:
+@@ -123,6 +128,26 @@ units:
      name: delegate
      timeout: 3.0
  
@@ -106,6 +253,260 @@ index 4f05e99..84a1ff6 100644
    # Planning units (without routing/state check for CARLA)
    - path: /autoware/planning
      type: and
+@@ -131,7 +156,10 @@ units:
+         list:
+           - { type: link, link: /autoware/planning/topic_rate_check/route }
+           - { type: link, link: /autoware/planning/topic_rate_check/trajectory }
+-          - { type: link, link: /autoware/planning/trajectory_validation }
++          # [주차 데모 임시] scenario LANE<->PARKING 전환 시 궤적 점프로
++          # trajectory_validation ERROR -> emergency 플랩 (8/10 실측).
++          # supervisor가 MRM 소유권을 가지므로 데모 동안 제외. 원복 필수.
++          # - { type: link, link: /autoware/planning/trajectory_validation }
+ 
+   - path: /autoware/planning/topic_rate_check/route
+     type: diag
+diff --git a/autoware_launch/config/system/diagnostics/autoware-carla.yaml.bak_demo b/autoware_launch/config/system/diagnostics/autoware-carla.yaml.bak_demo
+new file mode 100644
+index 0000000..84a1ff6
+--- /dev/null
++++ b/autoware_launch/config/system/diagnostics/autoware-carla.yaml.bak_demo
+@@ -0,0 +1,236 @@
++# CARLA Simulator Specific Diagnostic Configuration
++# This builds the diagnostic graph with increased timeouts suitable for CARLA simulation
++# which has inherent network latency and slower update rates
++
++# Include component diagnostic configurations
++files:
++  - { path: $(dirname)/control.yaml }
++  - { path: $(dirname)/map.yaml }
++  - { path: $(dirname)/perception.yaml }
++  - { path: $(dirname)/system.yaml }
++  - { path: $(dirname)/vehicle.yaml }
++
++# Define operation modes and diagnostic units with CARLA-appropriate timeouts
++units:
++  # Operation Modes
++  - path: /autoware/modes/local
++    type: and
++    list:
++      - { type: link, link: /autoware/vehicle }
++      - { type: link, link: /autoware/system }
++      - { type: link, link: /autoware/control/local }
++      - { type: link, link: /adapi/mrm_request/delegate }
++
++  - path: /autoware/modes/remote
++    type: and
++    list:
++      - { type: link, link: /autoware/vehicle }
++      - { type: link, link: /autoware/system }
++      - { type: link, link: /autoware/control/remote }
++      - { type: link, link: /adapi/mrm_request/delegate }
++
++  - path: /autoware/modes/stop
++    type: and
++    list:
++      - { type: link, link: /adapi/mrm_request/delegate }
++
++  - path: /autoware/modes/autonomous
++    type: and
++    list:
++      - { type: link, link: /autoware/map }
++      - { type: link, link: /autoware/localization }
++      - { type: link, link: /autoware/planning }
++      - { type: link, link: /autoware/perception }
++      - { type: link, link: /autoware/control }
++      - { type: link, link: /autoware/vehicle }
++      - { type: link, link: /autoware/system }
++      - { type: link, link: /adapi/mrm_request/delegate }
++      - { type: link, link: /autoware/cdr/perception_score }
++      - { type: link, link: /autoware/cdr/supervisor_defer }
++
++  - path: /autoware/modes/pull_over
++    type: and
++    list:
++      - { type: link, link: /autoware/map }
++      - { type: link, link: /autoware/localization }
++      - { type: link, link: /autoware/planning }
++      - { type: link, link: /autoware/perception }
++      - { type: link, link: /autoware/control }
++      - { type: link, link: /autoware/vehicle }
++      - { type: link, link: /autoware/system }
++      - { type: link, link: /adapi/mrm_request/delegate }
++
++  - path: /autoware/modes/comfortable_stop
++    type: and
++    list:
++      - { type: link, link: /autoware/map }
++      - { type: link, link: /autoware/localization }
++      - { type: link, link: /autoware/planning }
++      - { type: link, link: /autoware/control }
++      - { type: link, link: /autoware/vehicle }
++      - { type: link, link: /autoware/system }
++
++  - path: /autoware/modes/emergency_stop
++    type: and
++    list:
++      - { type: link, link: /autoware/vehicle }
++      - { type: link, link: /autoware/system }
++
++  - path: /autoware/debug/tools
++    type: and
++    list:
++      - { type: link, link: /autoware/system/service_log_checker }
++
++  # Localization units with extended timeouts for CARLA
++  # Note: Removed transform and pose_twist_fusion topic monitors as they fail to load
++  - path: /autoware/localization
++    type: and
++    list:
++      - type: link
++        link: /autoware/localization/state
++      - type: and
++        list:
++          - { type: link, link: /autoware/localization/scan_matching_status }
++          - { type: link, link: /autoware/localization/accuracy }
++          - { type: link, link: /autoware/localization/sensor_fusion_status }
++
++  - path: /autoware/localization/state
++    type: diag
++    node: /adapi/node/localization
++    name: state
++    timeout: 3.0
++
++  - path: /autoware/localization/scan_matching_status
++    type: diag
++    node: ndt_scan_matcher
++    name: scan_matching_status
++    timeout: 3.0
++
++  - path: /autoware/localization/accuracy
++    type: diag
++    node: localization_error_monitor
++    name: ellipse_error_status
++    timeout: 3.0
++
++  - path: /autoware/localization/sensor_fusion_status
++    type: diag
++    node: localization
++    name: ekf_localizer
++    timeout: 3.0
++
++  # MRM request delegate with extended timeout
++  - path: /adapi/mrm_request/delegate
++    type: diag
++    node: /adapi/node/mrm_request
++    name: delegate
++    timeout: 3.0
++
++  # cdr_monitor dynamic-FTTI perception score (fs_ws thesis failsafe).
++  # ERROR (score <= 0.3) makes /autoware/modes/autonomous unavailable ->
++  # mrm_handler triggers MRM. WARN (0.3..0.7) stays available so the
++  # mrm_supervisor reroute owns that band. Requires cdr_monitor running,
++  # otherwise this unit goes stale and autonomous cannot engage.
++  - path: /autoware/cdr/perception_score
++    type: diag
++    node: cdr_monitor
++    name: sensing/perception_score
++    timeout: 3.0
++
++  # mrm_supervisor DEFER hand-over: ERROR while the supervisor is in
++  # MRM_DEFER (TL gate / low localization / score floor) so the stock
++  # mrm_handler takes over with comfortable/emergency stop.
++  - path: /autoware/cdr/supervisor_defer
++    type: diag
++    node: mrm_supervisor
++    name: defer_request
++    timeout: 3.0
++
++  # Planning units (without routing/state check for CARLA)
++  - path: /autoware/planning
++    type: and
++    list:
++      - type: and
++        list:
++          - { type: link, link: /autoware/planning/topic_rate_check/route }
++          - { type: link, link: /autoware/planning/topic_rate_check/trajectory }
++          - { type: link, link: /autoware/planning/trajectory_validation }
++
++  - path: /autoware/planning/topic_rate_check/route
++    type: diag
++    node: topic_state_monitor_mission_planning_route
++    name: planning_topic_status
++
++  - path: /autoware/planning/topic_rate_check/trajectory
++    type: diag
++    node: topic_state_monitor_scenario_planning_trajectory
++    name: planning_topic_status
++
++  - path: /autoware/planning/trajectory_validation
++    type: and
++    list:
++      - { type: link, link: /autoware/planning/trajectory_validation/finite }
++      - { type: link, link: /autoware/planning/trajectory_validation/interval }
++      - { type: link, link: /autoware/planning/trajectory_validation/curvature }
++      - { type: link, link: /autoware/planning/trajectory_validation/angle }
++      - { type: link, link: /autoware/planning/trajectory_validation/lateral_acceleration }
++      - { type: link, link: /autoware/planning/trajectory_validation/acceleration }
++      - { type: link, link: /autoware/planning/trajectory_validation/deceleration }
++      - { type: link, link: /autoware/planning/trajectory_validation/steering }
++      - { type: link, link: /autoware/planning/trajectory_validation/steering_rate }
++      - { type: link, link: /autoware/planning/trajectory_validation/velocity_deviation }
++      - { type: link, link: /autoware/planning/trajectory_validation/trajectory_shift }
++
++  - path: /autoware/planning/trajectory_validation/finite
++    type: diag
++    node: planning_validator
++    name: trajectory_validation_finite
++
++  - path: /autoware/planning/trajectory_validation/interval
++    type: diag
++    node: planning_validator
++    name: trajectory_validation_interval
++
++  - path: /autoware/planning/trajectory_validation/curvature
++    type: diag
++    node: planning_validator
++    name: trajectory_validation_curvature
++
++  - path: /autoware/planning/trajectory_validation/angle
++    type: diag
++    node: planning_validator
++    name: trajectory_validation_relative_angle
++
++  - path: /autoware/planning/trajectory_validation/lateral_acceleration
++    type: diag
++    node: planning_validator
++    name: trajectory_validation_lateral_acceleration
++
++  - path: /autoware/planning/trajectory_validation/acceleration
++    type: diag
++    node: planning_validator
++    name: trajectory_validation_acceleration
++
++  - path: /autoware/planning/trajectory_validation/deceleration
++    type: diag
++    node: planning_validator
++    name: trajectory_validation_deceleration
++
++  - path: /autoware/planning/trajectory_validation/steering
++    type: diag
++    node: planning_validator
++    name: trajectory_validation_steering
++
++  - path: /autoware/planning/trajectory_validation/steering_rate
++    type: diag
++    node: planning_validator
++    name: trajectory_validation_steering_rate
++
++  - path: /autoware/planning/trajectory_validation/velocity_deviation
++    type: diag
++    node: planning_validator
++    name: trajectory_validation_velocity_deviation
++
++  - path: /autoware/planning/trajectory_validation/trajectory_shift
++    type: diag
++    node: planning_validator
++    name: trajectory_validation_trajectory_shift
 diff --git a/autoware_launch/config/system/diagnostics/control.yaml b/autoware_launch/config/system/diagnostics/control.yaml
 index 7a12d5a..28eb35f 100644
 --- a/autoware_launch/config/system/diagnostics/control.yaml
@@ -129,27 +530,38 @@ index 7a12d5a..28eb35f 100644
        - { type: link, link: /autoware/control/performance_monitoring/control_state }
  
    - path: /autoware/control/node_alive_monitoring/command_gate
-diff --git a/autoware_launch/launch/e2e_simulator.launch.xml b/autoware_launch/launch/e2e_simulator.launch.xml
-index 83a7dec..7ca091f 100644
---- a/autoware_launch/launch/e2e_simulator.launch.xml
-+++ b/autoware_launch/launch/e2e_simulator.launch.xml
-@@ -7,6 +7,10 @@
-   <arg name="sensor_model" default="sample_sensor_kit" description="sensor model name"/>
-   <arg name="data_path" default="$(env HOME)/autoware_data" description="packages data and artifacts directory path"/>
-   <arg name="simulator_type" default="awsim" description="select the simulator type ('awsim' or 'carla')"/>
-+  <!-- AWCL runs the cpp bridge instead of autoware_carla_interface, so
-+       simulator_type stays 'awsim'; this selects just the diagnostics graph
-+       (autoware-carla.yaml has CARLA-rate timeouts + cdr_monitor units). -->
-+  <arg name="diagnostic_graph_type" default="$(var simulator_type)" description="diagnostics graph variant (autoware-&lt;type&gt;.yaml)"/>
- 
-   <!-- launch module preset -->
-   <arg name="planning_module_preset" default="default" description="planning module preset"/>
-@@ -71,7 +75,7 @@
-       <!-- System -->
-       <arg name="launch_system_monitor" value="$(var launch_system_monitor)"/>
-       <arg name="launch_dummy_diag_publisher" value="$(var launch_dummy_diag_publisher)"/>
--      <arg name="diagnostic_graph_aggregator_graph_path" value="$(find-pkg-share autoware_launch)/config/system/diagnostics/autoware-$(var simulator_type).yaml"/>
-+      <arg name="diagnostic_graph_aggregator_graph_path" value="$(find-pkg-share autoware_launch)/config/system/diagnostics/autoware-$(var diagnostic_graph_type).yaml"/>
-       <!-- Sensing -->
-       <arg name="launch_sensing_driver" value="$(var launch_sensing_driver)"/>
-       <!-- Perception-->
+diff --git a/autoware_launch/rviz/autoware.rviz b/autoware_launch/rviz/autoware.rviz
+index 3011db2..735dbe7 100644
+--- a/autoware_launch/rviz/autoware.rviz
++++ b/autoware_launch/rviz/autoware.rviz
+@@ -25,6 +25,30 @@ Panels:
+ Visualization Manager:
+   Class: ""
+   Displays:
++    - Class: rviz_default_plugins/MarkerArray
++      Enabled: true
++      Name: MRM Supervisor HUD
++      Namespaces:
++        {}
++      Topic:
++        Depth: 5
++        Durability Policy: Volatile
++        History Policy: Keep Last
++        Reliability Policy: Reliable
++        Value: /mrm_supervisor/hud
++      Value: true
++    - Class: rviz_default_plugins/MarkerArray
++      Enabled: true
++      Name: MRM Candidates
++      Namespaces:
++        {}
++      Topic:
++        Depth: 5
++        Durability Policy: Volatile
++        History Policy: Keep Last
++        Reliability Policy: Reliable
++        Value: /mrm_supervisor/candidates
++      Value: true
+     - Class: rviz_common/Group
+       Displays:
+         - Class: rviz_default_plugins/TF

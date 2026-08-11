@@ -68,6 +68,11 @@ class MapModel:
             lp, rp = self._ways.get(left), self._ways.get(right)
             if not lp or not rp:
                 continue
+            # 좌/우 경계 way 그리기 방향이 반대면(수제 회랑) i-i 짝이 교차로
+            # 묶여 center가 한 점으로 붕괴 → 길이 0, successor 매칭 오염.
+            # 우측 점열을 좌측 진행 방향에 정렬한다.
+            if math.dist(lp[0], rp[0]) > math.dist(lp[0], rp[-1]):
+                rp = list(reversed(rp))
             n = min(len(lp), len(rp))
             center = [((lp[int(i * (len(lp) - 1) / max(1, n - 1))][0] +
                         rp[int(i * (len(rp) - 1) / max(1, n - 1))][0]) / 2.0,
@@ -95,6 +100,25 @@ class MapModel:
 
     # ------------------------------------------------------------------ graph
     def _build_graph(self):
+        # 경계 way 그리기 방향이 제각각이라 center 방향 추정이 틀리는 lanelet이
+        # 있다(8/11 실측: 8479 등 9개가 successor 0인 '싱크'가 되어 그 위에서
+        # fault 시 전 후보 unreachable). 1차 빌드 후 출구 없는 도로 lanelet의
+        # center를 뒤집어 재빌드하는 교정 패스를 최대 2회 돈다.
+        for _pass in range(3):
+            self._build_graph_once()
+            sinks = [lid for lid, edges in self.graph.items() if not edges]
+            if not sinks or _pass == 2:
+                if sinks:
+                    print(f"[map_model] warning: {len(sinks)} sink lanelets remain: {sinks[:6]}")
+                break
+            flipped = 0
+            for lid in sinks:
+                self.lanelets[lid]["center"] = list(reversed(self.lanelets[lid]["center"]))
+                flipped += 1
+            if not flipped:
+                break
+
+    def _build_graph_once(self):
         roads = {lid: ll for lid, ll in self.lanelets.items() if ll["subtype"] == "road"}
         self.graph = {lid: [] for lid in roads}
 
@@ -136,6 +160,18 @@ class MapModel:
                     best, best_d = lid, d
         return best
 
+    def nearest_road_lanelets(self, x, y, k=3):
+        """최근접 도로 lanelet k개 (거리순). 교차로 내부 lanelet처럼 그래프
+        출구가 없는 소스에 스냅됐을 때의 폴백용 (8/11 agg 케이스 실측:
+        lanelet 8576에서 전 후보 unreachable -> 즉시 DEFER)."""
+        scored = []
+        for lid, ll in self.lanelets.items():
+            if ll["subtype"] != "road":
+                continue
+            d = min((px - x) ** 2 + (py - y) ** 2 for px, py in ll["center"][::2])
+            scored.append((d, lid))
+        return [lid for _, lid in sorted(scored)[:k]]
+
     def route(self, src, dst):
         """Dijkstra over road lanelets, minimizing travel time.
         -> (length_m, time_s, traffic_light_count) or None."""
@@ -170,6 +206,11 @@ class MapModel:
 
         for lid, ll in self.lanelets.items():
             if ll["subtype"] != "road_shoulder":
+                continue
+            if str(lid) == "1271":
+                # 헛간 회랑 서향 차선 — 라우팅 고립 문제로 road_shoulder로
+                # 리태그된 도로임(8/10). 역방향 차선 위 정차는 유효한 노측
+                # 대피가 아니므로 후보에서 제외 (유령 타깃 방지)
                 continue
             c = ll["center"]
             # feasibility: a moving lateral-shift pull-over cannot fit into a
@@ -218,12 +259,64 @@ class MapModel:
             gx, gy = max(
                 ((0.5 * (px + cx), 0.5 * (py + cy)) for px, py in pts),
                 key=road_dist)
-            target = self.nearest_road_lanelet(cx, cy)
+            # 목표 차선은 중심점이 아니라 "도로에 가장 가까운 경계점" 기준으로
+            # 배정 — 중심점 기준은 도로 반대편(역방향) 차선을 고를 수 있어
+            # 합법 경로가 수백 m 우회로 계산된다 (900000 실측: 346m/신호등 2)
+            n_pts = len(pts)
+            edge_mids = [((pts[i][0] + pts[(i + 1) % n_pts][0]) / 2.0,
+                          (pts[i][1] + pts[(i + 1) % n_pts][1]) / 2.0)
+                         for i in range(n_pts)]
+            anchor = min(list(pts) + edge_mids, key=road_dist)
+            target = self.nearest_road_lanelet(*anchor)
             if target is None:
                 continue
+            # 목표 자세: 도로에 정확히 수직(진입 방향) + 폴리곤 가로 중앙 정렬.
+            # 어긋난 yaw는 footprint 대각선이 소형 패드 경계를 넘겨
+            # freespace goal invalid를 유발한다 (실측: 113도에서 0.23m 초과)
             tc = self.lanelets[target]["center"]
-            yaw = math.atan2(tc[-1][1] - tc[0][1], tc[-1][0] - tc[0][0])
-            cands.append(Candidate("parking_lot", f"parking_{wid}", gx, gy, yaw,
-                                   target, parking_sectors))
+            road_yaw = math.atan2(tc[-1][1] - tc[0][1], tc[-1][0] - tc[0][0])
+            perp = road_yaw + math.pi / 2.0
+            dx, dy = math.cos(perp), math.sin(perp)
+            if dx * (gx - cx) + dy * (gy - cy) < 0:   # 깊은 쪽(도로 반대)으로
+                perp += math.pi
+                dx, dy = -dx, -dy
+            depth = max(dx * (px - cx) + dy * (py - cy) for px, py in pts)
+            # 위치: 깊이 30% 지점(접근 단계 goal_planner가 폴리곤 안 정지하는
+            # 실측 배치). yaw: 도로 쪽(nose-out) — base_link 기준 전방 돌출이
+            # 남쪽(도로)으로 향해 벽 여유가 양방향 2.5m+ (오프라인 A* 검증: 9.7m 경로)
+            # 최종 자세: 순수 수직 nose-in(perp) + 얕은 깊이(0.15).
+            # 대각 45°는 코너가 3.5m 뻗어 폭 5m 패드에 해가 공집합(격자 실측),
+            # 수직은 가로폭 ±1.07m로 여유 확보. 결속은 89.45°<90° 통과
+            # (케이스 11~14 직진 접근 실증). 깊이 0.15는 북쪽 벽(코 전방 3.9m)
+            # 회피 — 코 y≈11.5 vs 벽 12.1 (여유 0.6m+)
+            gx2, gy2 = cx + dx * depth * 0.3, cy + dy * depth * 0.3
+            yaw_goal = perp + math.pi   # [900000 촬영용: 성공 당시(nose-out) 레시피]
+            if str(wid) == "900000":
+                # [남측 영상 데모: 0809_0037 PARKED_SUCCESS 실측 주차 포즈를
+                #  골로 직접 지정 — freespace가 이미 한 번 도달한 검증된 포즈]
+                gx2, gy2, yaw_goal = -40.0, -5.9, -2.86
+            elif str(wid) == "1002367":
+                # [우측 실주차장 데모: 헛간 앞 포장 앞마당 중앙, 북향 nose-in]
+                gx2, gy2, yaw_goal = -17.0, 14.0, -1.5708  # 빈 슬롯, 이웃차 이격 2.0m
+            elif str(wid) == "1003001":
+                # [북쪽 헛간 14칸 라인: 레벨에 구워진 정적 주차차 3대(BMW x-70,
+                #  Jeep x-45.8, Leon x-32.3, env_objects 실측)와 겹치는 칸은 A*
+                #  "Invalid goal". 확실히 빈 중동부 칸(spot 1002542, x=-51.8),
+                #  북향 nose-in. y는 68.3: 앞범퍼(base_link+3.83m)가 폴리곤
+                #  북변(73.0) 안에 들어야 함 — 69.2는 앞코 73.03으로 3cm 초과
+                #  -> wayarea 밖 셀 충돌로 A* Invalid goal (8/10 실측)]
+                gx2, gy2, yaw_goal = -51.75, 68.3, 1.5708
+            elif str(wid) == "1003003":
+                # [북서 세로 패드: spot 중심(109.1)은 북쪽 덤불 군락(y 111.5+,
+                #  env_objects 실측)에 footprint가 물려 A* Invalid — 남동쪽으로
+                #  당겨 여유 확보. 남향 nose, 폴리곤(남변 104 확장) 안 수용]
+                gx2, gy2, yaw_goal = -140.9, 108.3, -1.5708
+            elif str(wid) == "1003002":
+                # [북서 로터리: 섬 중앙 지향 — 중앙 조형물(반경~0.8m)만 피해
+                #  2.2m 동쪽, 북향. 연석은 costmap min_lidar_height 0.3으로 무시.
+                #  폴리곤은 섬+동측 진입 링까지 커버(in_lot 전환용)]
+                gx2, gy2, yaw_goal = -147.5, 91.9, 1.5708
+            cands.append(Candidate("parking_lot", f"parking_{wid}", gx2, gy2,
+                                   yaw_goal, target, parking_sectors))
 
         return cands

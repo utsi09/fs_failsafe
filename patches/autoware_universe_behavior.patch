@@ -1,0 +1,25 @@
+diff --git a/planning/behavior_path_planner/autoware_behavior_path_planner_common/src/utils/utils.cpp b/planning/behavior_path_planner/autoware_behavior_path_planner_common/src/utils/utils.cpp
+index df56283a0..3a2c09b9f 100644
+--- a/planning/behavior_path_planner/autoware_behavior_path_planner_common/src/utils/utils.cpp
++++ b/planning/behavior_path_planner/autoware_behavior_path_planner_common/src/utils/utils.cpp
+@@ -525,14 +525,18 @@ bool isEgoOutOfRoute(
+   const bool is_in_shoulder_lane = !route_handler->getShoulderLaneletsAtPose(self_pose).empty();
+   // Check if ego vehicle is in road lane
+   const bool is_in_road_lane = std::invoke([&]() {
+-    if (lanelet::utils::isInLanelet(self_pose, closest_road_lane)) {
++    // [awcl] 1.5 m margin: with noisy localization (GNSS fault injection) the
++    // zero-margin polygon test intermittently fails right after a reroute,
++    // latching out-of-route before any module starts (observed 2026-08-11).
++    constexpr double kEgoLaneMargin = 1.5;
++    if (lanelet::utils::isInLanelet(self_pose, closest_road_lane, kEgoLaneMargin)) {
+       return true;
+     }
+ 
+     // check previous lanes for backward driving (e.g. pull out)
+     const auto prev_lanes = route_handler->getPreviousLanelets(closest_road_lane);
+     for (const auto & lane : prev_lanes) {
+-      if (lanelet::utils::isInLanelet(self_pose, lane)) {
++      if (lanelet::utils::isInLanelet(self_pose, lane, kEgoLaneMargin)) {
+         return true;
+       }
+     }

@@ -41,7 +41,7 @@ from visualization_msgs.msg import MarkerArray
 from autoware_agent.tum_ros_base_agent import TUMROSBaseAgent, BridgeHelper
 from autoware_agent.aw_converter import AutowareConverter
 from autoware_adapi_v1_msgs.msg import LocalizationInitializationState, RouteState, OperationModeState
-from autoware_vehicle_msgs.msg import SteeringReport, VelocityReport, Engage, ControlModeReport
+from autoware_vehicle_msgs.msg import SteeringReport, VelocityReport, Engage, ControlModeReport, GearReport, GearCommand
 from autoware_control_msgs.msg import Control
 from autoware_perception_msgs.msg import PredictedObjects, TrafficLightGroupArray, TrafficLightGroup, TrafficLightElement
 from tier4_vehicle_msgs.msg import ActuationStatusStamped
@@ -111,6 +111,11 @@ class AutowareE2EAgent(TUMROSBaseAgent):
         self._steering_report_publisher = self.ros_node.create_publisher(SteeringReport, "/vehicle/status/steering_status", qos_profile=QoSProfile(depth=1, durability=DurabilityPolicy.VOLATILE))
         self._velocity_report_publisher = self.ros_node.create_publisher(VelocityReport, "/vehicle/status/velocity_status", qos_profile=QoSProfile(depth=1, durability=DurabilityPolicy.VOLATILE))
         self._control_mode_report_publisher = self.ros_node.create_publisher(ControlModeReport, "/vehicle/status/control_mode", qos_profile=QoSProfile(depth=1, durability=DurabilityPolicy.VOLATILE))
+        # 기어 루프백: Autoware가 후진 궤적 실행 전 gear_status로 R 확인을
+        # 기다림 — CARLA엔 기어 개념이 없어(reverse 플래그) 명령을 즉시 반향
+        self._gear_report_publisher = self.ros_node.create_publisher(GearReport, "/vehicle/status/gear_status", qos_profile=QoSProfile(depth=1, durability=DurabilityPolicy.VOLATILE))
+        self._gear_cmd_value = 2  # DRIVE
+        self._gear_cmd_subscriber = self.ros_node.create_subscription(GearCommand, "/control/command/gear_cmd", self._gear_cmd_callback, qos_profile=QoSProfile(depth=1, durability=DurabilityPolicy.VOLATILE))
         #self._actuation_report_publisher = self.ros_node.create_publisher(ActuationStatusStamped, "/vehicle/status/actuation_status", qos_profile=QoSProfile(depth=1, durability=DurabilityPolicy.VOLATILE))
         # Publisher & Subscriber for Goal Planning
         self._goal_publisher = self.ros_node.create_publisher(PoseStamped, "/rviz/routing/rough_goal", qos_profile=QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
@@ -204,6 +209,8 @@ class AutowareE2EAgent(TUMROSBaseAgent):
             self.ros_node.declare_parameter("gn", os.environ.get("gn", ""))
             # imb=<t>:<bias_rad_s>: constant gyro z bias (see run_step)
             self.ros_node.declare_parameter("imb", os.environ.get("imb", ""))
+            # imd=<t>:<slope_rad_s2>: gyro z bias RAMP (드리프트, see run_step)
+            self.ros_node.declare_parameter("imd", os.environ.get("imd", ""))
             # rain=<t>: heavy-rain weather preset (lidar/camera degrade physically)
             self.ros_node.declare_parameter("rain", os.environ.get("rain", ""))
             # gb=<t>[:<dur_s>]: GNSS blackout (publish gated in this agent)
@@ -223,10 +230,21 @@ class AutowareE2EAgent(TUMROSBaseAgent):
             # (background traffic spawns mostly ahead — rear-end pressure for
             # in-lane MRM stops needs an explicit chaser)
             self.ros_node.declare_parameter("tail", os.environ.get("tail", ""))
+            # clearnpc=1: 배경 NPC 차량 전부 제거(우측 실주차장 데모 —
+            # 정차 ego 주변에 교통이 몰려 freespace 경로를 막는 것 방지)
+            self.ros_node.declare_parameter("clearnpc", os.environ.get("clearnpc", ""))
+            # npccap=<N>: 배경 NPC를 N대로 상한(주기 컬링, actor id 순 유지).
+            # npccap=0 은 clearnpc 와 동일 — 트래픽 밀도 차원(none/low) 실험용
+            self.ros_node.declare_parameter("npccap", os.environ.get("npccap", ""))
+            # npcadd=<N>: 배경 NPC N대 추가 스폰(TM_SEED 결정적) — 밀도 high 실험용
+            self.ros_node.declare_parameter("npcadd", os.environ.get("npcadd", ""))
         self._fault_t0 = None
         self._camera_killed = False
         self._lidar_killed = False
         self._tail_spawned = False
+        self._npc_clear_tick = 0
+        self._npc_cap_tick = 0
+        self._npc_added = False
         self._tail_actor = None
         self._fault_announced = False
         self._bridge_noise_started = set()
@@ -235,6 +253,7 @@ class AutowareE2EAgent(TUMROSBaseAgent):
         self._imu_noise_sigma = 0.0
         self._gnss_noise_sigma = 0.0
         self._imu_gyro_bias = 0.0
+        self._imu_gyro_drift = 0.0
         self._rain_applied = False
         self._gnss_blackout = False
         self._gb_bridge_sent = False
@@ -245,8 +264,14 @@ class AutowareE2EAgent(TUMROSBaseAgent):
         # V2X sens gt traffic light states
         # Either the camera image or the v2x need to be set true
         # For visualisation you can also set both to true 
-        self._use_v2x_traffic_light = False
+        # 신호등 소스 선택: 카메라 계열 fault(cf/cn/cfl/cfl2/mix) 케이스는
+        # 고장이 신호 인식에도 미치는 게 실험 취지이므로 카메라 인식 유지.
+        # 그 외(gn/ln/imn/nf 등) 케이스는 신호등이 실험 변인이 아니므로 V2X로
+        # 받아 "초록불 인식 미스 → 교차로 프리징" 무관 노이즈를 제거 (8/11).
+        _cam_fault = any(os.environ.get(k) for k in ("cf", "cn", "cfl", "cfl2", "mix"))
+        self._use_v2x_traffic_light = not _cam_fault
         self._publish_cam_image = True
+        print(f"[TL SOURCE] {'camera (camera-fault case)' if _cam_fault else 'V2X ground truth'}")
         self._traffic_light_ids = set()  
 
         self._steps_before_init = 0
@@ -394,6 +419,80 @@ class AutowareE2EAgent(TUMROSBaseAgent):
                     print("[FAULT INJECTION] camera destroy failed:", e)
                 self._camera_killed = True
 
+        # clearnpc=1: 배경 NPC 차량을 주기적으로 전부 제거(우측 실주차장 데모).
+        # 앞마당 주차 차량들은 정적 메시라 영향 없음 — 움직이는 교통만 사라짐.
+        try:
+            if (self.ros_node.get_parameter("clearnpc").value
+                    and self._counter - self._npc_clear_tick >= 5):
+                self._npc_clear_tick = self._counter
+                world = CarlaDataProvider.get_world()
+                killed = 0
+                for v in world.get_actors().filter("vehicle.*"):
+                    if v.attributes.get("role_name") in ("hero", "ego_vehicle"):
+                        continue
+                    try:
+                        v.destroy(); killed += 1
+                    except Exception:
+                        pass
+                if killed:
+                    print(f"[DEMO] cleared {killed} background NPC vehicle(s)")
+        except Exception:
+            pass
+
+        # npccap=<N>: 배경 NPC를 N대까지만 유지. 스폰 순서(actor id 오름차순)로
+        # 남길 차를 고정해 rep 간 재현성 유지. tail_npc 는 별도 축이므로 제외.
+        try:
+            capv = self.ros_node.get_parameter("npccap").value
+            if capv != "" and self._counter - self._npc_cap_tick >= 5:
+                self._npc_cap_tick = self._counter
+                cap = int(capv)
+                world = CarlaDataProvider.get_world()
+                background = sorted(
+                    (v for v in world.get_actors().filter("vehicle.*")
+                     if v.attributes.get("role_name")
+                     not in ("hero", "ego_vehicle", "tail_npc")),
+                    key=lambda v: v.id)
+                killed = 0
+                for v in background[cap:]:
+                    try:
+                        v.destroy(); killed += 1
+                    except Exception:
+                        pass
+                if killed:
+                    print(f"[NPC] capped background traffic to {cap} "
+                          f"(destroyed {killed})")
+        except Exception:
+            pass
+
+        # npcadd=<N>: 스폰 완료 후 1회, 오토파일럿 배경차 N대 추가(밀도 high).
+        # TM_SEED 로 스폰 지점/차종을 고정해 rep 간 재현성 유지.
+        if (not self._npc_added and self._counter > 60
+                and self.ros_node.get_parameter("npcadd").value):
+            self._npc_added = True
+            try:
+                import random as _random
+                n = int(self.ros_node.get_parameter("npcadd").value)
+                world = CarlaDataProvider.get_world()
+                tm_port = CarlaDataProvider.get_traffic_manager_port()
+                lib = [bp for bp in world.get_blueprint_library().filter("vehicle.*")
+                       if int(bp.get_attribute("number_of_wheels")) == 4]
+                sps = world.get_map().get_spawn_points()
+                rng = _random.Random(int(os.environ.get("TM_SEED", "100")))
+                rng.shuffle(sps)
+                added = 0
+                for tf in sps:
+                    if added >= n:
+                        break
+                    bp = rng.choice(lib)
+                    bp.set_attribute("role_name", "extra_npc")
+                    v = world.try_spawn_actor(bp, tf)   # 점유된 지점은 None -> skip
+                    if v is not None:
+                        v.set_autopilot(True, tm_port)
+                        added += 1
+                print(f"[NPC] spawned {added}/{n} extra background vehicle(s)")
+            except Exception as e:
+                print("[NPC] extra spawn failed:", e)
+
         # tail=<gap_m>: keep a chasing NPC behind the ego for the WHOLE case.
         # A one-shot spawn drifts away (the TM picks its own turns at
         # junctions) — re-check every ~5 s and respawn when lost/far.
@@ -497,6 +596,16 @@ class AutowareE2EAgent(TUMROSBaseAgent):
         # bias-instability term, IEEE Std 952 / El-Sheimy et al. 2008).
         spec = self._parse_fault(self.ros_node.get_parameter("imb").value, 0.02)
         self._imu_gyro_bias = spec[1] if spec and fault_elapsed >= spec[0] else 0.0
+
+        # imd=<t>:<slope_rad_s2>: gyro z bias RAMP (드리프트). 계단형 imb와
+        # 달리 바이어스 자체가 시간에 비례해 커진다 — Allan variance의 rate
+        # random walk/온도 드리프트 근사. 감지 지연이 램프 기울기에 반비례하는
+        # CUSUM 특성 곡선 검증용 (작을수록 늦게, 그러나 반드시 잡힘).
+        spec = self._parse_fault(self.ros_node.get_parameter("imd").value, 0.005)
+        if spec and fault_elapsed >= spec[0]:
+            self._imu_gyro_drift = spec[1] * (fault_elapsed - spec[0])
+        else:
+            self._imu_gyro_drift = 0.0
 
         # rain=<t>: switch the CARLA weather to a heavy downpour at t.
         # Environmental (not component) degradation: rain physically
@@ -691,6 +800,7 @@ class AutowareE2EAgent(TUMROSBaseAgent):
                 self._bridge_noise_started or self._camera_killed
                 or self._lidar_killed or self._imu_noise_sigma > 0.0
                 or self._gnss_noise_sigma > 0.0 or self._imu_gyro_bias != 0.0
+                or self._imu_gyro_drift != 0.0
                 or self._rain_applied or self._gnss_blackout):
             self._fault_announced = True
             self._fault_active_pub.publish(Bool(data=True))
@@ -742,6 +852,12 @@ class AutowareE2EAgent(TUMROSBaseAgent):
         control_mode_report_msg.mode = ControlModeReport.AUTONOMOUS
         self._control_mode_report_publisher.publish(control_mode_report_msg)
 
+        # Gear Report (명령 반향)
+        gear_report_msg = GearReport()
+        gear_report_msg.stamp = aw_time
+        gear_report_msg.report = self._gear_cmd_value
+        self._gear_report_publisher.publish(gear_report_msg)
+
         # Goal
         self.publish_global_plan(position["position"])
         # Engage if goal is published and not autonomous
@@ -769,8 +885,9 @@ class AutowareE2EAgent(TUMROSBaseAgent):
             imu_msg.linear_acceleration.z += float(np.random.normal(0.0, 10.0 * s))
         # imb: constant yaw-rate bias on the gyro z axis (integrates into a
         # growing heading error downstream — see the imb comment in run_step)
-        if self._imu_gyro_bias != 0.0:
-            imu_msg.angular_velocity.z += float(self._imu_gyro_bias)
+        # imd: ramp bias(드리프트)도 같은 축에 합산
+        if self._imu_gyro_bias != 0.0 or self._imu_gyro_drift != 0.0:
+            imu_msg.angular_velocity.z += float(self._imu_gyro_bias + self._imu_gyro_drift)
         self._imu_pub.publish(imu_msg)
         
         if self._use_v2x_traffic_light:
@@ -1099,6 +1216,9 @@ class AutowareE2EAgent(TUMROSBaseAgent):
                 "\033[93mThis vehicle command will be ignored.\033[0m",
                 sep=" ")
         
+    def _gear_cmd_callback(self, msg):
+        self._gear_cmd_value = msg.command
+
     def _acc_callback(self, acc_msg):
         self._awp_converter.getAcc(acc_msg)
 

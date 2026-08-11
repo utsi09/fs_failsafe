@@ -45,7 +45,10 @@ AUTOWARE_CMD = ("cd /home/taewook/autoware_awcl/autoware && "
 LEADERBOARD_CMD = ("cd /home/taewook/autoware_carla_leaderboard && "
                    "source install/setup.bash && source carla_envs.sh && "
                    "./run_leaderboard.sh {faults}")
-CDR_CMD = "cd ~/fs_ws && source install/setup.bash && ros2 launch cdr_monitor cdr_monitor_awcl.launch.py"
+# [우측 실주차장 데모 임시] CDR_DEMO_NO_ERROR=1: gn 노이즈 스파이크가 Autoware
+# 자체 MRM을 격발해 주차 기동을 끊는 것 방지 (WARN 구간 소유권은 supervisor 설계).
+# supervisor DEFER 핸드오버 진단은 유지. 데모 후 원복 필수.
+CDR_CMD = "cd ~/fs_ws && source install/setup.bash && CDR_DEMO_NO_ERROR=1 ros2 launch cdr_monitor cdr_monitor_awcl.launch.py"
 DUMP_CMD = ("source ~/autoware_awcl/autoware/install/setup.bash && "
             "ros2 run autoware_diagnostic_graph_utils dump_node")
 SUP_CMD = ("cd ~/fs_ws && source install/setup.bash && "
@@ -53,7 +56,7 @@ SUP_CMD = ("cd ~/fs_ws && source install/setup.bash && "
 
 AUTOWARE_READY_NODE = "behavior_path_planner"
 AUTOWARE_READY_TIMEOUT = 120.0
-CASE_TIMEOUT_S = 420.0          # hard cap per case
+CASE_TIMEOUT_S = 900.0          # 임시: 주차 데모용 (원복 필요)
 STOPPED_SPEED = 0.15            # m/s
 DEFER_STOP_CONFIRM_S = 30.0     # DEFER + stopped this long -> case over
 # Town07 lights: ~10 s green per ~45 s rotation. Missing ONE green is
@@ -64,6 +67,12 @@ JUNCTION_STUCK_S = 100.0
 # red-light wait en route to the shoulder can exceed 60 s — give MRM_MOVE
 # three full cycles before calling it stuck
 MRM_MOVE_STUCK_S = 150.0
+# 주차장 타깃은 정차 5s+scenario 전환+costmap+A*(30s+)+freespace 기동으로
+# 정지 구간이 길다 — 150 s로 자르면 기동 중 케이스를 사살한다.
+# v3.6b: supervisor stall 재시도 체인(180s×3)까지 수용하도록 560 s.
+# 타이머 위계: supervisor 재시도(~540) < judge 560 < leaderboard blocked 600
+# < CASE_TIMEOUT 900 (8/11 실측: 321s 걸려 성공하는 트래픽 케이스 존재)
+MRM_MOVE_STUCK_PARKING_S = 560.0
 # --mrm-off (FTTI 도출 모드): 고장 후 이 시간 동안 무사고면 SURVIVED,
 # 고장 이후 시작된 정지가 이 시간 이상 지속되면 HAZARD_STOPPED
 HAZARD_SURVIVE_S = 360.0
@@ -83,6 +92,8 @@ SEVERITY = {
     "imn": {"mid": 0.05, "high": 0.15},
     "gn":  {"mid": 1.0,  "high": 2.5},
     "imb": {"mid": 0.3,  "high": 1.0},   # v2: 자이로 바이어스 [rad/s]
+    "imd": {"mid": 0.005, "high": 0.02},  # 자이로 바이어스 램프(드리프트) [rad/s^2]
+                                          # mid: 60s에 imb-mid 수준 도달, high: 15s
 }
 SEV_LEVELS = ["mid", "high"]
 # ln: BOTH lidars noise; cn: camera noise; imn: IMU noise; gn: GNSS/EKF pose
@@ -90,14 +101,17 @@ SEV_LEVELS = ["mid", "high"]
 FAULT_KINDS = ["ln", "cn", "imn", "gn", "cf", "lf", "nf"]
 # v2 추가 고장: imb=자이로 바이어스, rain=폭우 프리셋, gb=GNSS 블랙아웃.
 # 기본 매트릭스에는 넣지 않고 --fault 로 명시 선택했을 때만 실행된다.
-EXTRA_FAULT_KINDS = ["imb", "rain", "gb", "cfl", "mix", "cfl2", "lfl2"]
+EXTRA_FAULT_KINDS = ["imb", "imd", "rain", "gb", "cfl", "mix", "cfl2", "lfl2"]
 NO_SEVERITY = {"cf", "lf", "nf", "rain", "gb", "cfl", "mix", "cfl2", "lfl2"}  # no severity dimension (nf: no trigger either)
 # fault time is a RANDOM COVARIATE, not a matrix dimension: fixed trigger
 # times pinned the fault to the same spots so the supervisor always picked
 # the same shoulder. Per-case t is drawn deterministically from the cell key
 # (reproducible; ours/baseline share it like TM_SEED) and recorded in the CSV.
 TRIGGER_RANGE = (10, 45)   # goal_planner owns the last ~25 s of the ~85 s drive
-NPC_STYLES = ["def", "agg"]
+# v3: 트래픽 밀도를 매트릭스 차원으로 승격 — 무교통/기본/공격적 3수준
+NPC_STYLES = ["none", "def", "agg"]
+# 매트릭스 밖 보조 스타일 (--npc 로 명시 선택): low=4대 상한, high=기본+8대
+EXTRA_NPC_STYLES = ["low", "high"]
 METHODS = ["ours", "baseline"]      # baseline = stock Autoware MRM (in-lane stop)
 REPEATS = 15
 
@@ -125,8 +139,10 @@ def build_cases(args):
     cases = []
     # v2 고장은 --fault 로 명시했을 때만 매트릭스에 합류
     fault_kinds = FAULT_KINDS + [f for f in EXTRA_FAULT_KINDS if f == args.fault]
+    # 밀도 스타일(none/low/high)도 --npc 로 명시했을 때만 매트릭스에 합류
+    npc_styles = NPC_STYLES + [s for s in EXTRA_NPC_STYLES if s == args.npc]
     for fault, sev, npc, rep, method in itertools.product(
-            fault_kinds, SEV_LEVELS, NPC_STYLES,
+            fault_kinds, SEV_LEVELS, npc_styles,
             range(args.reps if args.reps is not None else REPEATS), methods):
         if fault in NO_SEVERITY and sev != "mid":
             continue  # destruction faults have no severity dimension
@@ -165,8 +181,19 @@ def fault_args(case, dg="1"):
     args += f" TM_SEED={100 + case['rep']}"
     if case["npc"] == "agg":
         args += " npc=agg"
+    elif case["npc"] == "none":
+        args += " npccap=0"
+    elif case["npc"] == "low":
+        args += " npccap=4"
+    elif case["npc"] == "high":
+        args += " npcadd=8"
     # guaranteed chaser behind the ego (rear-end pressure on MRM stops)
-    args += " tail=10"
+    if os.environ.get("DEMO_CLEARNPC"):
+        args += " clearnpc=1"      # [우측 실주차장 데모: 배경차 제거, 꼬리차 생략]
+    elif case["npc"] == "none":
+        pass                       # 무교통 조건: 꼬리차도 생략
+    else:
+        args += " tail=10"
     if dg:
         # direct-goal: start -> final destination only, no intermediate
         # waypoints (same setup as the working 7/28 demo). dg="" disables.
@@ -537,7 +564,13 @@ class Judge:
             # transiently mid-drive — require an actual sustained stop
             if (verdict is None
                     and self.aw_state == self.MrmState.MRM_SUCCEEDED and self.moved
-                    and stopped_for > 5.0):
+                    and stopped_for > 5.0
+                    # 주차장 MOVE 중에는 보류: Parking A* 스톨(수 초 틱 정지)로
+                    # rate 체크가 일괄 ERROR -> AW emergency가 일시 SUCCEEDED 되는
+                    # 게 정상 경과 (8/10 실측 — 회복 후 주차 계속). 케이스 상한은
+                    # MRM_MOVE_STUCK_PARKING_S(240s)와 CASE_TIMEOUT이 담당.
+                    and not (self.state.startswith("MRM_MOVE")
+                             and ":parking" in self.state)):
                 behavior = self.aw_behaviors[-1] if self.aw_behaviors else "UNKNOWN"
                 verdict = f"AW_{behavior}_DONE"
             if (verdict is None and self.state.startswith("MRM_DEFER")
@@ -583,7 +616,9 @@ class Judge:
                     and stationary_for > JUNCTION_STUCK_S):
                 self.stall_factor = capture_stall_factor()   # 확정 직전 1회 (v2)
                 return "STUCK_AT_JUNCTION", self._detail()
-            if self.state.startswith("MRM_MOVE") and stopped_for > MRM_MOVE_STUCK_S:
+            if self.state.startswith("MRM_MOVE") and stopped_for > (
+                    MRM_MOVE_STUCK_PARKING_S if ":parking" in self.state
+                    else MRM_MOVE_STUCK_S):
                 self.stall_factor = capture_stall_factor()   # 확정 직전 1회 (v2)
                 return "STUCK_IN_MRM_MOVE", self._detail()
             if elapsed > CASE_TIMEOUT_S:
@@ -871,7 +906,10 @@ def run(args):
                 if not args.mrm_off:
                     procs.host_bg(cdr_cmd, "cdr")
                     baseline = "true" if case["method"] == "baseline" else "false"
-                    procs.host_bg(SUP_CMD.format(baseline=baseline), "supervisor")
+                    sup_cmd = SUP_CMD.format(baseline=baseline)
+                    if args.no_shoulder:
+                        sup_cmd += " demo_no_shoulder:=true"
+                    procs.host_bg(sup_cmd, "supervisor")
                 else:
                     # --mrm-off 1차 배터리 실패 원인: cdr/supervisor를 아예 안
                     # 띄우면 진단 그래프의 두 유닛이 STALE -> autonomous 잠금
@@ -948,8 +986,9 @@ if __name__ == "__main__":
                     help="severity (smoke: sets it; full run: filters matrix)")
     ap.add_argument("--t", type=int,
                     help="fault trigger time [s] (smoke: sets it; full run: filters)")
-    ap.add_argument("--npc", choices=NPC_STYLES,
-                    help="npc style (smoke: sets it; full run: filters matrix)")
+    ap.add_argument("--npc", choices=NPC_STYLES + EXTRA_NPC_STYLES,
+                    help="npc style (smoke: sets it; full run: filters matrix); "
+                         "none/low/high = 밀도 조건 (매트릭스 밖)")
     ap.add_argument("--reps", type=int,
                     help=f"repetitions per cell (default {REPEATS})")
     ap.add_argument("--limit", type=int,
@@ -968,6 +1007,8 @@ if __name__ == "__main__":
                     help="FTTI 도출 모드: 모니터/MRM 없이 고장->위험사건 시간 기록")
     ap.add_argument("--retry-failed", metavar="CSV",
                     help="기존 결과 CSV의 CARLA_DIED/SETUP_FAIL 케이스만 재실행")
+    ap.add_argument("--no-shoulder", action="store_true",
+                    help="demo: exclude shoulder candidates so a parking lot wins")
     ap.add_argument("--no-log-archive", action="store_true",
                     help="케이스별 cdr/supervisor 로그 gzip 보관을 끈다")
     args = ap.parse_args()
