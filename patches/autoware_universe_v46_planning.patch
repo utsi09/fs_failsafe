@@ -1,0 +1,86 @@
+diff --git a/planning/autoware_freespace_planner/src/autoware_freespace_planner/freespace_planner_node.cpp b/planning/autoware_freespace_planner/src/autoware_freespace_planner/freespace_planner_node.cpp
+index 314b7e945..6f8e5b4ef 100644
+--- a/planning/autoware_freespace_planner/src/autoware_freespace_planner/freespace_planner_node.cpp
++++ b/planning/autoware_freespace_planner/src/autoware_freespace_planner/freespace_planner_node.cpp
+@@ -407,7 +407,19 @@ void FreespacePlannerNode::planTrajectory()
+     target_index_ = utils::get_next_target_index(
+       trajectory_.points.size(), reversing_indices_, prev_target_index_);
+   } else {
+-    RCLCPP_INFO(get_logger(), "Can't find goal: %s", error_msg.c_str());
++    // [디버그 계측] 기각 순간의 실제 입력값 자백 — 라이브/오프라인 괴리 규명용
++    const auto & sp = current_pose_in_costmap_frame.position;
++    const auto & gp = goal_pose_in_costmap_frame.position;
++    const double d_s = algo_->getDistanceToObstacle(current_pose_in_costmap_frame);
++    const double d_g = algo_->getDistanceToObstacle(goal_pose_in_costmap_frame);
++    RCLCPP_INFO(
++      get_logger(),
++      "Can't find goal: %s | start=(%.2f,%.2f,q z%.3f w%.3f) goal=(%.2f,%.2f,q z%.3f w%.3f) grid_org=(%.1f,%.1f) d_s=%.2f d_g=%.2f",
++      error_msg.c_str(), sp.x, sp.y, current_pose_in_costmap_frame.orientation.z,
++      current_pose_in_costmap_frame.orientation.w, gp.x, gp.y,
++      goal_pose_in_costmap_frame.orientation.z, goal_pose_in_costmap_frame.orientation.w,
++      occupancy_grid_->info.origin.position.x, occupancy_grid_->info.origin.position.y,
++      d_s, d_g);
+     reset();
+   }
+ }
+diff --git a/planning/autoware_scenario_selector/src/node.cpp b/planning/autoware_scenario_selector/src/node.cpp
+index b7dbe4a83..62ad0ca72 100644
+--- a/planning/autoware_scenario_selector/src/node.cpp
++++ b/planning/autoware_scenario_selector/src/node.cpp
+@@ -24,7 +24,10 @@
+ #include <lanelet2_core/geometry/Point.h>
+ #include <lanelet2_core/geometry/Polygon.h>
+ 
++#include <algorithm>
++#include <cmath>
+ #include <deque>
++#include <limits>
+ #include <memory>
+ #include <string>
+ #include <utility>
+@@ -77,16 +80,42 @@ bool isInParkingLotWithGoal(
+   const geometry_msgs::msg::Pose & current_pose, const geometry_msgs::msg::Pose & goal_pose)
+ {
+   const auto & p = current_pose.position;
+-  const lanelet::Point3d ego_point(lanelet::InvalId, p.x, p.y, p.z);
++  const lanelet::BasicPoint2d ego_point(p.x, p.y);
+   const auto & g = goal_pose.position;
+   const lanelet::Point3d goal_point(lanelet::InvalId, g.x, g.y, g.z);
+ 
++  // [v4.5 데드락 픽스] within(ego) 이진 판정은 NPC에 막혀 폴리곤 1~2 m 밖에서
++  // 정지하거나(gn-def t=40 실측) goal 재송신 리셋 중 폴리곤을 통과해버리면(t=23)
++  // 영영 못 켜진다. goal을 품은 폴리곤까지 거리 8 m 이내면 도착으로 판정 —
++  // 원래 막던 원거리 조기 전환(goal이 costmap 70 m 밖)은 8 m에선 성립 불가,
++  // same-lot 조건(goal이 그 폴리곤 안)은 그대로 유지된다.
++  static constexpr double th_arrive_dist_m = 8.0;
++  const auto dist_to_polygon = [](const lanelet::BasicPoint2d & pt,
++                                  const lanelet::BasicPolygon3d & poly) {
++    double min_d = std::numeric_limits<double>::max();
++    const size_t n = poly.size();
++    for (size_t i = 0; i < n; ++i) {
++      const auto & a = poly[i];
++      const auto & b = poly[(i + 1) % n];
++      const double abx = b.x() - a.x(), aby = b.y() - a.y();
++      const double apx = pt.x() - a.x(), apy = pt.y() - a.y();
++      const double len2 = abx * abx + aby * aby;
++      const double t = len2 > 0.0 ? std::clamp((apx * abx + apy * aby) / len2, 0.0, 1.0) : 0.0;
++      const double dx = apx - t * abx, dy = apy - t * aby;
++      min_d = std::min(min_d, std::hypot(dx, dy));
++    }
++    return min_d;
++  };
++  const lanelet::Point3d ego_point3d(lanelet::InvalId, p.x, p.y, p.z);
+   const auto parking_lots =
+     lanelet::utils::query::getAllParkingLots(lanelet_map_ptr);
+   for (const auto & lot : parking_lots) {
++    if (!lanelet::geometry::within(goal_point, lot.basicPolygon())) {
++      continue;
++    }
+     if (
+-      lanelet::geometry::within(ego_point, lot.basicPolygon()) &&
+-      lanelet::geometry::within(goal_point, lot.basicPolygon())) {
++      lanelet::geometry::within(ego_point3d, lot.basicPolygon()) ||
++      dist_to_polygon(ego_point, lot.basicPolygon()) < th_arrive_dist_m) {
+       return true;
+     }
+   }

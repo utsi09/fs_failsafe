@@ -1,0 +1,37 @@
+diff --git a/autoware_launch/config/planning/scenario_planning/lane_driving/behavior_planning/behavior_velocity_planner/traffic_light.param.yaml b/autoware_launch/config/planning/scenario_planning/lane_driving/behavior_planning/behavior_velocity_planner/traffic_light.param.yaml
+index 74a0f36..1634b03 100644
+--- a/autoware_launch/config/planning/scenario_planning/lane_driving/behavior_planning/behavior_velocity_planner/traffic_light.param.yaml
++++ b/autoware_launch/config/planning/scenario_planning/lane_driving/behavior_planning/behavior_velocity_planner/traffic_light.param.yaml
+@@ -2,7 +2,7 @@
+   ros__parameters:
+     traffic_light:
+       stop_margin: 0.0
+-      tl_state_timeout: 1.0
++      tl_state_timeout: 3.0   # [v4.6e] V2X 재발행 지연 1.05s가 1.0s stale 판정에 걸림 (0812)
+       stop_time_hysteresis: 0.1
+       yellow_lamp_period: 2.75
+       yellow_light_stop_velocity: 1.0 # Velocity threshold (m/s) below which the vehicle will always stop before the traffic light when the signal turns yellow, regardless of the pass_judge decision.
+diff --git a/autoware_launch/launch/e2e_simulator.launch.xml b/autoware_launch/launch/e2e_simulator.launch.xml
+index 83a7dec..7ca091f 100644
+--- a/autoware_launch/launch/e2e_simulator.launch.xml
++++ b/autoware_launch/launch/e2e_simulator.launch.xml
+@@ -7,6 +7,10 @@
+   <arg name="sensor_model" default="sample_sensor_kit" description="sensor model name"/>
+   <arg name="data_path" default="$(env HOME)/autoware_data" description="packages data and artifacts directory path"/>
+   <arg name="simulator_type" default="awsim" description="select the simulator type ('awsim' or 'carla')"/>
++  <!-- AWCL runs the cpp bridge instead of autoware_carla_interface, so
++       simulator_type stays 'awsim'; this selects just the diagnostics graph
++       (autoware-carla.yaml has CARLA-rate timeouts + cdr_monitor units). -->
++  <arg name="diagnostic_graph_type" default="$(var simulator_type)" description="diagnostics graph variant (autoware-&lt;type&gt;.yaml)"/>
+ 
+   <!-- launch module preset -->
+   <arg name="planning_module_preset" default="default" description="planning module preset"/>
+@@ -71,7 +75,7 @@
+       <!-- System -->
+       <arg name="launch_system_monitor" value="$(var launch_system_monitor)"/>
+       <arg name="launch_dummy_diag_publisher" value="$(var launch_dummy_diag_publisher)"/>
+-      <arg name="diagnostic_graph_aggregator_graph_path" value="$(find-pkg-share autoware_launch)/config/system/diagnostics/autoware-$(var simulator_type).yaml"/>
++      <arg name="diagnostic_graph_aggregator_graph_path" value="$(find-pkg-share autoware_launch)/config/system/diagnostics/autoware-$(var diagnostic_graph_type).yaml"/>
+       <!-- Sensing -->
+       <arg name="launch_sensing_driver" value="$(var launch_sensing_driver)"/>
+       <!-- Perception-->

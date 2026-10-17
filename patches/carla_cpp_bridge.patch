@@ -179,7 +179,7 @@ index 7c208d8..1f76254 100644
  
    camera_info_.header.stamp = aw_time_;
 diff --git a/src/autoware_carla_cpp_bridge/src/lidar_bridge.cpp b/src/autoware_carla_cpp_bridge/src/lidar_bridge.cpp
-index 9f12092..04e34c2 100644
+index 9f12092..e15ccc9 100644
 --- a/src/autoware_carla_cpp_bridge/src/lidar_bridge.cpp
 +++ b/src/autoware_carla_cpp_bridge/src/lidar_bridge.cpp
 @@ -1,4 +1,5 @@
@@ -188,7 +188,7 @@ index 9f12092..04e34c2 100644
  #include <memory>
  
  namespace autoware_carla_cpp_bridge
-@@ -17,6 +18,14 @@ LidarBridge::LidarBridge(
+@@ -17,6 +18,27 @@ LidarBridge::LidarBridge(
  {
    RCLCPP_INFO(this->get_logger(), "LidarBridge Node '%s' started.", node_name.c_str());
  
@@ -199,26 +199,95 @@ index 9f12092..04e34c2 100644
 +  this->declare_parameter<double>("noise_sigma", 0.0);
 +  this->declare_parameter<double>("noise_yaw_center", 0.0);
 +  this->declare_parameter<double>("noise_yaw_width", 360.0);
++  // [v4.6 lso] 오염 섹터 — 커버 투과율 모델 (Trierweiler 2019 실측 + Goodin
++  // 2019 검출문턱: 섹터 내 강도 x T^2, rho*T^2/R^2 < P_min 이면 미검출 소실
++  // -> 멀고 어두운 표적부터 죽는 거리·반사율 의존 소실이 자동으로 나온다)
++  this->declare_parameter<double>("cover_transmission", 1.0);
++  this->declare_parameter<double>("dropout_yaw_center", 0.0);
++  this->declare_parameter<double>("dropout_yaw_width", 0.0);
++  // [v4.6 lcl] 강수 — Beer-Lambert 감쇠(Goodin 2019: alpha=0.01*Rr^0.6 [1/m],
++  // Rr=강우량 mm/h) + 거리지터 sigma=0.02*R*(1-e^-Rr)^2 + 근거리 클러터
++  // (LISA/Hahner: 후방산란 클러터는 센서 근처 편중 -> 2차 근접편중 샘플링)
++  this->declare_parameter<double>("rain_rate_mmh", 0.0);
++  this->declare_parameter<int>("clutter_points", 0);
++  this->declare_parameter<double>("clutter_range_m", 10.0);
++  this->declare_parameter<double>("range_max_m", 100.0);
 +
    // Publisher
    rclcpp::QoS qos(rclcpp::KeepLast(5));
    qos.best_effort();
-@@ -123,6 +132,11 @@ void LidarBridge::lidarCallback(const sensor_msgs::msg::PointCloud2::SharedPtr m
+@@ -72,12 +94,14 @@ void LidarBridge::lidarCallback(const sensor_msgs::msg::PointCloud2::SharedPtr m
+   size_t points_per_channel = total_points / num_channels_;
+   size_t valid_point_count = points_per_channel * num_channels_;
+ 
++  const int clutter_n = static_cast<int>(this->get_parameter("clutter_points").as_int());
++
+   modified_msg.point_step = 16;
+   modified_msg.row_step = modified_msg.point_step * valid_point_count;
+   modified_msg.width = valid_point_count;
+   modified_msg.height = 1;
+   modified_msg.is_dense = true;
+-  modified_msg.data.resize(valid_point_count * modified_msg.point_step);
++  modified_msg.data.resize((valid_point_count + std::max(clutter_n, 0)) * modified_msg.point_step);
+ 
+   // Resize fields
+   modified_msg.fields.resize(6);
+@@ -123,6 +147,25 @@ void LidarBridge::lidarCallback(const sensor_msgs::msg::PointCloud2::SharedPtr m
  
    PointXYZIRC* points = reinterpret_cast<PointXYZIRC*>(modified_msg.data.data());
  
 +  const float sigma = static_cast<float>(this->get_parameter("noise_sigma").as_double());
 +  const float yaw_c = static_cast<float>(this->get_parameter("noise_yaw_center").as_double());
 +  const float yaw_w = static_cast<float>(this->get_parameter("noise_yaw_width").as_double());
++  const float cover_T = static_cast<float>(this->get_parameter("cover_transmission").as_double());
++  const float drop_c = static_cast<float>(this->get_parameter("dropout_yaw_center").as_double());
++  const float drop_w = static_cast<float>(this->get_parameter("dropout_yaw_width").as_double());
++  const float rain_rr = static_cast<float>(this->get_parameter("rain_rate_mmh").as_double());
++  const float clutter_range = static_cast<float>(this->get_parameter("clutter_range_m").as_double());
++  const float range_max = static_cast<float>(this->get_parameter("range_max_m").as_double());
++  // 검출 문턱 (Goodin 2019): P_min = 0.9/(pi * R_max^2)
++  const float pmin = 0.9f / (3.1415926f * range_max * range_max);
++  const float rain_alpha = rain_rr > 0.0f ? 0.01f * std::pow(rain_rr, 0.6f) : 0.0f;
++  const float rain_jit = rain_rr > 0.0f
++      ? 0.02f * std::pow(1.0f - std::exp(-rain_rr), 2.0f) : 0.0f;
 +  std::normal_distribution<float> noise_dist(0.0f, sigma > 0.0f ? sigma : 1.0f);
++  std::normal_distribution<float> stdnorm(0.0f, 1.0f);
++  std::uniform_real_distribution<float> uni(0.0f, 1.0f);
 +
++  size_t out = 0;
    for (size_t i = 0; i < valid_point_count; ++i) {
        const uint8_t* src = &msg->data[i * msg->point_step];
  
-@@ -131,6 +145,26 @@ void LidarBridge::lidarCallback(const sensor_msgs::msg::PointCloud2::SharedPtr m
+@@ -131,16 +174,86 @@ void LidarBridge::lidarCallback(const sensor_msgs::msg::PointCloud2::SharedPtr m
        float z = *reinterpret_cast<const float*>(src + 8);
        float intensity_f = *reinterpret_cast<const float*>(src + 12);
  
++      const float r2 = x * x + y * y + z * z;
++      const float r = std::sqrt(r2);
++      float rho = std::clamp(intensity_f, 0.0f, 1.0f);  // CARLA 강도 = 반사율 프록시
++
++      // [lso] 오염 섹터: 강도 x T^2 (커버 왕복 투과), 문턱 미달 -> 미검출
++      if (cover_T < 1.0f && drop_w > 0.0f) {
++        float az = std::atan2(y, x) * 57.29578f;
++        float d = std::fabs(az - drop_c);
++        if (d > 180.0f) d = 360.0f - d;
++        if (d <= drop_w * 0.5f) {
++          rho *= cover_T * cover_T;
++          if (r2 > 0.01f && rho / r2 < pmin) continue;
++        }
++      }
++      // [lcl] 강수 감쇠: Beer-Lambert 왕복, 문턱 미달 -> 소실 + 거리 지터
++      if (rain_alpha > 0.0f && r > 0.01f) {
++        rho *= std::exp(-2.0f * rain_alpha * r);
++        if (rho / r2 < pmin) continue;
++        const float sj = rain_jit * r;  // Goodin: sigma = 0.02*R*(1-e^-Rr)^2
++        if (sj > 0.0f) {
++          const float scale = 1.0f + sj * stdnorm(rng_) / r;
++          x *= scale; y *= scale; z *= scale;
++        }
++      }
++      intensity_f = rho;
++
 +      if (sigma > 0.0f) {
 +        bool in_sector = yaw_w >= 360.0f;
 +        if (!in_sector) {
@@ -241,4 +310,44 @@ index 9f12092..04e34c2 100644
 +
        uint8_t intensity = static_cast<uint8_t>(std::clamp(intensity_f * 255.0f, 0.0f, 255.0f));
  
-       points[i].x = x;
+-      points[i].x = x;
+-      points[i].y = y;
+-      points[i].z = z;
+-      points[i].intensity = intensity;
+-      points[i].return_type = 0;
+-      points[i].channel = static_cast<uint16_t>(i % num_channels_);
++      points[out].x = x;
++      points[out].y = y;
++      points[out].z = z;
++      points[out].intensity = intensity;
++      points[out].return_type = 0;
++      points[out].channel = static_cast<uint16_t>(i % num_channels_);
++      ++out;
+   }
+ 
++  // [lcl] 근거리 클러터 주입: 강수/물보라의 저강도 부유 점.
++  // 거리는 근접 편중(2차) 샘플링 — LISA/Hahner 후방산란 프로파일(센서 근처
++  // 집중)의 단순화. u^2 로 2 m 쪽에 밀도 집중.
++  if (clutter_n > 0) {
++    for (int k = 0; k < clutter_n; ++k) {
++      const float az = uni(rng_) * 6.2831853f;
++      const float u = uni(rng_);
++      const float r = 2.0f + u * u * std::max(clutter_range - 2.0f, 0.1f);
++      const float zz = -0.4f + uni(rng_) * 1.6f;
++      points[out].x = r * std::cos(az);
++      points[out].y = r * std::sin(az);
++      points[out].z = zz;
++      points[out].intensity = 4;
++      points[out].return_type = 0;
++      points[out].channel = static_cast<uint16_t>(k % num_channels_);
++      ++out;
++    }
++  }
++
++  modified_msg.width = out;
++  modified_msg.row_step = modified_msg.point_step * out;
++  modified_msg.data.resize(out * modified_msg.point_step);
++
+     lidar_pub_->publish(modified_msg);
+ 
+     if (sync_state_){

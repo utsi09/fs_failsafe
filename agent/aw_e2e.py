@@ -137,7 +137,14 @@ class AutowareE2EAgent(TUMROSBaseAgent):
 
         # V2X Traffic Light
         self._lanelet_map_subscriber = self.ros_node.create_subscription(MarkerArray, "/map/vector_map_marker", self._get_traffic_lights_from_lanelet, qos_profile=QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
-        self._external_traffic_light_publisher = self.ros_node.create_publisher(TrafficLightGroupArray, "/perception/traffic_light_recognition/traffic_signals", qos_profile=QoSProfile(depth=1, durability=DurabilityPolicy.VOLATILE))
+        # [v4.6f] QoSProfile(depth=1, durability=VOLATILE) 부분지정 구성에서 이
+        # publisher만 wire 무발신(동일 노드 타 토픽 정상, 컨테이너 rclpy 자가
+        # 테스트 정상, 그래프엔 등록 — 0812 새벽 실측). 기본 QoS로 교체.
+        self._external_traffic_light_publisher = self.ros_node.create_publisher(TrafficLightGroupArray, "/perception/traffic_light_recognition/traffic_signals", 10)
+        # [v4.6e] arbiter 정식 V2X 입력(external) — 직접 발행은 arbiter의 judged
+        # 출력과 경합해 신호가 됐다 안 됐다 한다(0812 nf 교차로 스턱 실측).
+        # arbiter가 camera(internal)와 병합하도록 external에도 같은 메시지 발행.
+        self._external_v2x_arbiter_publisher = self.ros_node.create_publisher(TrafficLightGroupArray, "/perception/traffic_light_recognition/external/traffic_signals", 10)
 
         # Sync stuff
         self._aw_time = None
@@ -205,6 +212,13 @@ class AutowareE2EAgent(TUMROSBaseAgent):
             self.ros_node.declare_parameter("ln", os.environ.get("ln", ""))
             self.ros_node.declare_parameter("lnf", os.environ.get("lnf", ""))
             self.ros_node.declare_parameter("lnr", os.environ.get("lnr", ""))
+            # lso=<t>:<ratio>:<width_deg>: 전방 라이다 오염 섹터 드롭아웃 (기본 0.6:90)
+            self.ros_node.declare_parameter("lso", os.environ.get("lso", ""))
+            # lcl=<t>:<clutter_n>:<far_ratio>: 강수 근거리 클러터+원거리 감쇠 (기본 1500:0.15)
+            self.ros_node.declare_parameter("lcl", os.environ.get("lcl", ""))
+            # gm=<t>:<sigma_m>:<tau_s>: GNSS 1차 Gauss-Markov 상관편향 (멀티패스/
+            # NLOS 모사 — 백색 gn과 달리 EKF가 믿고 따라가는 최악 케이스)
+            self.ros_node.declare_parameter("gm", os.environ.get("gm", ""))
             self.ros_node.declare_parameter("imn", os.environ.get("imn", ""))
             self.ros_node.declare_parameter("gn", os.environ.get("gn", ""))
             # imb=<t>:<bias_rad_s>: constant gyro z bias (see run_step)
@@ -252,6 +266,9 @@ class AutowareE2EAgent(TUMROSBaseAgent):
         self._npc_styled = False
         self._imu_noise_sigma = 0.0
         self._gnss_noise_sigma = 0.0
+        self._gm_sigma = 0.0        # [gm] 정상상태 편향 크기 [m] (0=비활성)
+        self._gm_tau = 30.0         # [gm] 상관시간 [s]
+        self._gm_bias = [0.0, 0.0]  # [gm] 현재 편향 상태 (x, y)
         self._imu_gyro_bias = 0.0
         self._imu_gyro_drift = 0.0
         self._rain_applied = False
@@ -272,7 +289,32 @@ class AutowareE2EAgent(TUMROSBaseAgent):
         self._use_v2x_traffic_light = not _cam_fault
         self._publish_cam_image = True
         print(f"[TL SOURCE] {'camera (camera-fault case)' if _cam_fault else 'V2X ground truth'}")
-        self._traffic_light_ids = set()  
+        self._traffic_light_ids = set()
+        # [v4.6d] 마커 스크레이프는 발행/수신 레이스로 ID가 새는 수가 있다
+        # (0812 실측: 9416 누락 -> "signal data not received" -> nf 교차로 영구
+        # 대기). lanelet2 osm에서 traffic_light 규제요소를 직접 파싱해 합집합.
+        try:
+            import xml.etree.ElementTree as _ET
+            # repo 마운트 사본을 1순위로 (awcl_maps 마운트는 agent 프로세스에서
+            # errno2가 나는 미스터리 — 0812 실측. 맵 수정 시 사본 cp 동기화 필수)
+            _map_osm = os.environ.get("LL2_MAP_OSM", "")
+            if not _map_osm:
+                for _cand in (
+                        "/home/taewook/autoware_carla_leaderboard/experiments/"
+                        "results/lanelet2_map_for_snapshot.osm",
+                        "/home/taewook/awcl_maps/Town07/lanelet2_map.osm"):
+                    if os.path.exists(_cand):
+                        _map_osm = _cand
+                        break
+            for _rel in _ET.parse(_map_osm).getroot().findall("relation"):
+                _tags = {t.get("k"): t.get("v") for t in _rel.findall("tag")}
+                if (_tags.get("type") == "regulatory_element"
+                        and _tags.get("subtype") == "traffic_light"):
+                    self._traffic_light_ids.add(int(_rel.get("id")))
+            print(f"[TL SOURCE] lanelet2 osm: "
+                  f"{len(self._traffic_light_ids)} traffic-light reg elems")
+        except Exception as _e:
+            print(f"[TL SOURCE] osm parse failed ({_e}) — marker scrape only")
 
         self._steps_before_init = 0
         self._counter = 0
@@ -359,6 +401,28 @@ class AutowareE2EAgent(TUMROSBaseAgent):
             except Exception as e:
                 print(f"[FAULT INJECTION] noise request on /{name} failed:", e)
 
+    def _set_bridge_params(self, node_names, values):
+        # [v4.6] lso/lcl 등 임의 브리지 파라미터 주입 (noise_sigma 전용이던
+        # _set_bridge_noise의 일반화 버전)
+        for name in node_names:
+            try:
+                cli = self.ros_node.create_client(SetParameters, f"/{name}/set_parameters")
+                req = SetParameters.Request()
+                ps = []
+                for k, v in values.items():
+                    if isinstance(v, int):
+                        pv = ParameterValue(type=ParameterType.PARAMETER_INTEGER,
+                                            integer_value=v)
+                    else:
+                        pv = ParameterValue(type=ParameterType.PARAMETER_DOUBLE,
+                                            double_value=float(v))
+                    ps.append(RclParameter(name=k, value=pv))
+                req.parameters = ps
+                cli.call_async(req)
+                print(f"[FAULT INJECTION] {values} requested on /{name}")
+            except Exception as e:
+                print(f"[FAULT INJECTION] param request on /{name} failed:", e)
+
     # After initial initialization the run step method should
     # wait for the next control signal
 
@@ -393,13 +457,18 @@ class AutowareE2EAgent(TUMROSBaseAgent):
                 client = CarlaDataProvider.get_client()
                 tm = client.get_trafficmanager(CarlaDataProvider.get_traffic_manager_port())
                 styled = 0
+                # [v4.6i] 차량별 랜덤 부주의: TM 차량은 전지적이라 "시야 제한"은
+                # 불가 — ignore 확률로 사람의 부주의를 분포로 흉내낸다.
+                # TM_SEED 시드 고정 -> ours/baseline 짝케이스가 같은 성격 분포.
+                import random as _rnd
+                _r = _rnd.Random(os.environ.get("TM_SEED", "0"))
                 for v in CarlaDataProvider.get_world().get_actors().filter("vehicle.*"):
                     if v.attributes.get("role_name") in ("hero", "ego_vehicle"):
                         continue
-                    tm.vehicle_percentage_speed_difference(v, -20.0)  # 20% above limit
+                    tm.vehicle_percentage_speed_difference(v, -_r.uniform(5.0, 30.0))
                     tm.distance_to_leading_vehicle(v, 1.2)            # tailgating (0.5 pinned stopped egos)
-                    tm.ignore_vehicles_percentage(v, 20.0)            # yields less
-                    tm.ignore_lights_percentage(v, 10.0)              # runs some lights
+                    tm.ignore_vehicles_percentage(v, _r.uniform(0.0, 40.0))
+                    tm.ignore_lights_percentage(v, _r.uniform(0.0, 20.0))
                     styled += 1
                 print(f"[NPC] aggressive style applied to {styled} vehicles")
             except Exception as e:
@@ -413,6 +482,11 @@ class AutowareE2EAgent(TUMROSBaseAgent):
                     world = CarlaDataProvider.get_world()
                     killed = 0
                     for s in world.get_actors().filter('sensor.camera.rgb'):
+                        # stop() 먼저: destroy는 서버측 적용이 지연돼 ~1.2 s
+                        # 유령 프레임이 남는다(0822 원장 실측) — 실제 센서 사망은
+                        # 즉시 침묵이므로 스트림부터 끊는다
+                        try: s.stop()
+                        except Exception: pass
                         s.destroy(); killed += 1
                     print(f"[FAULT INJECTION] destroyed {killed} camera sensor(s) at t+{fault_camera_delay:.0f}s")
                 except Exception as e:
@@ -513,7 +587,18 @@ class AutowareE2EAgent(TUMROSBaseAgent):
                                        ego.get_location()) < 60.0)
                     except Exception:
                         tail_ok = False
-                if not tail_ok:
+                # [주차 실험] def(비공격) 후행차는 주차장 부근(35 m)에서 리스폰
+                # 금지 — 후진주차 코앞 리스폰이 기동을 영구 봉쇄(8/11 실측).
+                # agg 는 그대로: 공격 교통이 공간을 안 내주는 조건 자체가 실험
+                # 변인이고, 그 경우 supervisor 가 노측으로 폴백한다.
+                _aggressive = os.environ.get("npc", "") == "agg"
+                _park_anchors = ((-22.6, -8.2), (-17.0, -14.0),
+                                 (-51.8, -69.2), (-148.0, -98.2),
+                                 (-147.5, -91.9), (-140.0, -110.0))
+                _el = ego.get_location()
+                _near_lot = any(math.hypot(_el.x - ax, _el.y - ay) < 35.0
+                                for ax, ay in _park_anchors)
+                if not tail_ok and not (_near_lot and not _aggressive):
                     if self._tail_actor is not None:
                         try:
                             self._tail_actor.destroy()
@@ -537,9 +622,11 @@ class AutowareE2EAgent(TUMROSBaseAgent):
                             # 0.5 m glued to the bumper at every stop and the
                             # ego could never resume -> permanent pin. 1.5 m
                             # still threatens but allows restart.
-                            tm.distance_to_leading_vehicle(npc, 1.5 if aggressive else 2.5)
+                            # def 는 여유롭게 따라오는 교통(7 m, 제한속도 -15%):
+                            # 후진주차에 공간을 내준다. agg 만 밀착 유지.
+                            tm.distance_to_leading_vehicle(npc, 1.5 if aggressive else 7.0)
                             tm.vehicle_percentage_speed_difference(
-                                npc, -30.0 if aggressive else -10.0)
+                                npc, -30.0 if aggressive else 15.0)
                             tm.ignore_lights_percentage(npc, 30.0 if aggressive else 0.0)
                             self._tail_actor = npc
                             print(f"[TAIL NPC] (re)spawned {gap:.0f}m behind ego"
@@ -559,6 +646,8 @@ class AutowareE2EAgent(TUMROSBaseAgent):
                         tag = (s.attributes.get("role_name", "")
                                + s.attributes.get("ros_name", "")).lower()
                         if "front" in tag:
+                            try: s.stop()
+                            except Exception: pass
                             s.destroy(); killed += 1
                     print(f"[FAULT INJECTION] destroyed {killed} front lidar(s) at t+{spec[0]:.0f}s")
                 except Exception as e:
@@ -581,12 +670,61 @@ class AutowareE2EAgent(TUMROSBaseAgent):
                 self._set_bridge_noise(nodes, spec[1], spec[2])
                 self._bridge_noise_started.add(flag)
 
+        # [v4.6] lso=<t>:<T>:<width_deg> — 전방 라이다 오염 섹터 (커버 투과율 T,
+        # Trierweiler 2019 실측 + Goodin 검출문턱; 전방 센서만)
+        if "lso" not in self._bridge_noise_started:
+            raw = str(self.ros_node.get_parameter("lso").value or "")
+            if raw:
+                parts = raw.split(":")
+                try:
+                    t0 = float(parts[0])
+                    trans = float(parts[1]) if len(parts) > 1 and parts[1] else 0.35
+                    width = float(parts[2]) if len(parts) > 2 and parts[2] else 90.0
+                    if fault_elapsed >= t0:
+                        self._set_bridge_params(["lidar_bridge_1"], {
+                            "cover_transmission": trans,
+                            "dropout_yaw_center": 0.0,
+                            "dropout_yaw_width": width})
+                        self._bridge_noise_started.add("lso")
+                except ValueError:
+                    print(f"[FAULT INJECTION] invalid lso spec {raw!r} — ignored")
+
+        # [v4.6] lcl=<t>:<rain_mmh>:<clutter_n> — 강수 (Beer-Lambert 감쇠
+        # alpha=0.01*Rr^0.6 + Goodin 거리지터 + 근거리 클러터; 양쪽 라이다)
+        if "lcl" not in self._bridge_noise_started:
+            raw = str(self.ros_node.get_parameter("lcl").value or "")
+            if raw:
+                parts = raw.split(":")
+                try:
+                    t0 = float(parts[0])
+                    rain = float(parts[1]) if len(parts) > 1 and parts[1] else 5.0
+                    clutter_n = int(float(parts[2])) if len(parts) > 2 and parts[2] else 1500
+                    if fault_elapsed >= t0:
+                        self._set_bridge_params(
+                            ["lidar_bridge_1", "lidar_bridge_2"], {
+                                "rain_rate_mmh": rain,
+                                "clutter_points": clutter_n,
+                                "clutter_range_m": 10.0})
+                        self._bridge_noise_started.add("lcl")
+                except ValueError:
+                    print(f"[FAULT INJECTION] invalid lcl spec {raw!r} — ignored")
+
         # imn=<t>:<sigma>: IMU noise (sigma rad/s on gyro, 10*sigma m/s^2 on accel)
         # gn=<t>:<sigma>: position noise (meters) on the pose fed to the EKF
         spec = self._parse_fault(self.ros_node.get_parameter("imn").value, 0.05)
         self._imu_noise_sigma = spec[1] if spec and fault_elapsed >= spec[0] else 0.0
         spec = self._parse_fault(self.ros_node.get_parameter("gn").value, 1.0)
         self._gnss_noise_sigma = spec[1] if spec and fault_elapsed >= spec[0] else 0.0
+        # [gm] t:sigma:tau — _parse_fault의 3번째 필드(sector 자리)를 tau로 재활용
+        gm_spec = self._parse_fault(self.ros_node.get_parameter("gm").value, 3.0)
+        if gm_spec and fault_elapsed >= gm_spec[0]:
+            self._gm_sigma = gm_spec[1]
+            try:
+                self._gm_tau = float(gm_spec[2]) if gm_spec[2] else 30.0
+            except (TypeError, ValueError):
+                self._gm_tau = 30.0
+        else:
+            self._gm_sigma = 0.0
 
         # imb=<t>:<bias_rad_s>: constant gyro z (yaw-rate) bias from t on.
         # White noise (imn) is zero-mean and gets absorbed by the EKF's
@@ -799,11 +937,22 @@ class AutowareE2EAgent(TUMROSBaseAgent):
         if not self._fault_announced and (
                 self._bridge_noise_started or self._camera_killed
                 or self._lidar_killed or self._imu_noise_sigma > 0.0
-                or self._gnss_noise_sigma > 0.0 or self._imu_gyro_bias != 0.0
+                or self._gnss_noise_sigma > 0.0 or self._gm_sigma > 0.0
+                or self._imu_gyro_bias != 0.0
                 or self._imu_gyro_drift != 0.0
                 or self._rain_applied or self._gnss_blackout):
             self._fault_announced = True
             self._fault_active_pub.publish(Bool(data=True))
+            # [0823] 고장 활성화 심시간 원장 — 저지 실명과 무관하게 지연 산출 가능
+            try:
+                _t = self._aw_time
+                _sim = _t.sec + _t.nanosec * 1e-9 if _t is not None else -1.0
+                import time as _tm
+                with open("/home/taewook/autoware_carla_leaderboard/experiments/"
+                          "results/fault_ledger.log", "a") as _f:
+                    _f.write(f"{_tm.time():.3f} FAULT_ACTIVE sim={_sim:.3f}\n")
+            except Exception:
+                pass
             print(f"[FAULT INJECTION] fault ACTIVE at t+{fault_elapsed:.1f}s (announced)")
 
         # Autoware Timing
@@ -826,8 +975,39 @@ class AutowareE2EAgent(TUMROSBaseAgent):
         ndt_pose_msg.pose.pose.position = Point(**position["position"])
         ndt_pose_msg.pose.pose.orientation = Quaternion(**position["orientation"])
         if self._gnss_noise_sigma > 0.0:
-            ndt_pose_msg.pose.pose.position.x += float(np.random.normal(0.0, self._gnss_noise_sigma))
-            ndt_pose_msg.pose.pose.position.y += float(np.random.normal(0.0, self._gnss_noise_sigma))
+            # [v5 절제] gn 고장의 실제 주입 지점 — 전용 RNG + 파형 트레이스
+            if not hasattr(self, "_fault_rng"):
+                import os as _os
+                self._fault_rng = np.random.default_rng(
+                    int(_os.environ.get("FAULT_SEED", "0")))
+                self._fault_idx = 0
+                _tp = _os.environ.get("FAULT_TRACE", "")
+                self._fault_tf = open(_tp, "a", buffering=1) if _tp else None
+            _gn = self._fault_rng.normal(0.0, self._gnss_noise_sigma, 2)
+            ndt_pose_msg.pose.pose.position.x += float(_gn[0])
+            ndt_pose_msg.pose.pose.position.y += float(_gn[1])
+            if self._fault_tf is not None:
+                self._fault_tf.write(f"{self._fault_idx},{_gn[0]:.6f},{_gn[1]:.6f}\n")
+            self._fault_idx += 1
+        # [gm] 1차 Gauss-Markov 상관편향: b <- a*b + N(0, sigma*sqrt(1-a^2)).
+        # a=exp(-dt/tau) — 편향이 tau 시간 스케일로 같은 방향을 유지하며 흘러
+        # EKF가 실제 이동으로 믿고 추종하는 멀티패스/NLOS형 최악 케이스.
+        if self._gm_sigma > 0.0:
+            _dt = 0.05  # sim tick
+            _a = math.exp(-_dt / max(self._gm_tau, 0.1))
+            _drive = self._gm_sigma * math.sqrt(max(1.0 - _a * _a, 1e-9))
+            if not hasattr(self, "_fault_rng"):
+                import os as _os
+                self._fault_rng = np.random.default_rng(
+                    int(_os.environ.get("FAULT_SEED", "0")))
+                self._fault_idx = 0
+                _tp = _os.environ.get("FAULT_TRACE", "")
+                self._fault_tf = open(_tp, "a", buffering=1) if _tp else None
+            for _i in (0, 1):
+                self._gm_bias[_i] = _a * self._gm_bias[_i] + float(
+                    self._fault_rng.normal(0.0, _drive))
+            ndt_pose_msg.pose.pose.position.x += self._gm_bias[0]
+            ndt_pose_msg.pose.pose.position.y += self._gm_bias[1]
         # gb: during a GNSS blackout the pose is simply not published
         if not self._gnss_blackout:
             self._gnss_pose_pub.publish(ndt_pose_msg)
@@ -876,13 +1056,28 @@ class AutowareE2EAgent(TUMROSBaseAgent):
         )
         imu_msg.linear_acceleration = Vector3(**loc_acc["position"])
         if self._imu_noise_sigma > 0.0:
+            # [v5 절제실험] 전용 fault RNG — 전역 np.random과 분리해 팔 간
+            # 코드 경로 차이가 파형을 오염 못 하게. FAULT_SEED로 실현 고정,
+            # FAULT_TRACE로 샘플 로그 (same-realization 증빙).
+            if not hasattr(self, "_fault_rng"):
+                import os as _os
+                self._fault_rng = np.random.default_rng(
+                    int(_os.environ.get("FAULT_SEED", "0")))
+                self._fault_idx = 0
+                _tp = _os.environ.get("FAULT_TRACE", "")
+                self._fault_tf = open(_tp, "a", buffering=1) if _tp else None
             s = self._imu_noise_sigma
-            imu_msg.angular_velocity.x += float(np.random.normal(0.0, s))
-            imu_msg.angular_velocity.y += float(np.random.normal(0.0, s))
-            imu_msg.angular_velocity.z += float(np.random.normal(0.0, s))
-            imu_msg.linear_acceleration.x += float(np.random.normal(0.0, 10.0 * s))
-            imu_msg.linear_acceleration.y += float(np.random.normal(0.0, 10.0 * s))
-            imu_msg.linear_acceleration.z += float(np.random.normal(0.0, 10.0 * s))
+            _n = self._fault_rng.normal(0.0, s, 6)
+            imu_msg.angular_velocity.x += float(_n[0])
+            imu_msg.angular_velocity.y += float(_n[1])
+            imu_msg.angular_velocity.z += float(_n[2])
+            imu_msg.linear_acceleration.x += float(_n[3] * 10.0)
+            imu_msg.linear_acceleration.y += float(_n[4] * 10.0)
+            imu_msg.linear_acceleration.z += float(_n[5] * 10.0)
+            if self._fault_tf is not None:
+                self._fault_tf.write(
+                    f"{self._fault_idx},{_n[2]:.6f}\n")
+            self._fault_idx += 1
         # imb: constant yaw-rate bias on the gyro z axis (integrates into a
         # growing heading error downstream — see the imb comment in run_step)
         # imd: ramp bias(드리프트)도 같은 축에 합산
@@ -892,6 +1087,10 @@ class AutowareE2EAgent(TUMROSBaseAgent):
         
         if self._use_v2x_traffic_light:
             # We set all autoware traffic lights to the state of the currently affecting traffic light
+            # [v4.6e 계측] 발행 경로 무발신 미스터리 — 100틱마다 상태 출력
+            if self._counter % 100 == 0:
+                print(f"[TL V2X] tick={self._counter} ids={len(self._traffic_light_ids)}"
+                      f" v2x={self._use_v2x_traffic_light}")
             traffict_light_state = self._awp_converter.get_current_traffic_light_state()
             traffic_light_msg = TrafficLightGroupArray()
             traffic_light_msg.stamp = aw_time
@@ -904,7 +1103,8 @@ class AutowareE2EAgent(TUMROSBaseAgent):
                 traffic_light_group.elements[0].status = 2
                 traffic_light_group.elements[0].confidence = 1.0 
                 traffic_light_msg.traffic_light_groups.append(traffic_light_group)           
-            self._external_traffic_light_publisher.publish(traffic_light_msg) 
+            self._external_traffic_light_publisher.publish(traffic_light_msg)
+            self._external_v2x_arbiter_publisher.publish(traffic_light_msg)
 
 
         self._ready_state_pub.publish(self.ready_status)

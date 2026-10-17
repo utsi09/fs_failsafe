@@ -42,12 +42,22 @@ class MapModel:
                                        if nd.get("ref") in nodes]
             way_tags[w.get("id")] = _tags(w)
 
-        # regulatory elements that are traffic lights
+        # regulatory elements that are traffic lights (+ their stop lines)
+        # [v4.8] 태그만 믿으면 안 된다: Town07 맵은 같은 방향 병행 차선 중
+        # 한쪽에만 regelem이 붙어 있어(예: 1229에만 있고 이웃 8328/1222 누락)
+        # Dijkstra 경로가 무태그 차선을 타면 n_tl이 과소집계된다 (0813 실측:
+        # cn 케이스가 "tl 0"으로 판정한 3003 경로가 실제로는 신호교차로 통과).
+        # 해법: 정지선(ref_line) 기하와 중심선 교차로 판정한다. 태그는 보조.
         tl_rel_ids = set()
+        tl_stoplines = {}                     # rel_id -> [(x, y), ...]
         for r in root.findall("relation"):
             tg = _tags(r)
             if tg.get("type") == "regulatory_element" and tg.get("subtype") == "traffic_light":
                 tl_rel_ids.add(r.get("id"))
+                for m in r.findall("member"):
+                    if m.get("role") == "ref_line" and m.get("ref") in self._ways:
+                        tl_stoplines[r.get("id")] = self._ways[m.get("ref")]
+                        break
 
         self.lanelets = {}
         for r in root.findall("relation"):
@@ -89,11 +99,34 @@ class MapModel:
                 "left": left, "right": right,
                 "center": center, "length": length, "has_tl": has_tl,
                 "speed": speed,
+                # 이 lanelet에 태그로 붙은 신호등 regelem id들 (기하 판정은 아래서 합류)
+                "tl_ids": {m.get("ref") for m in r.findall("member")
+                           if m.get("type") == "relation" and m.get("ref") in tl_rel_ids},
             }
+
+        # [v4.8] 신호 교차로를 "정지선 중심 35m 클러스터"로 묶어 교차로
+        # 중심점 목록을 만든다. lanelet 단위 태그 귀속은 병행 차선 누락
+        # (예: regelem 9430이 1229에만 붙고 이웃 차선 8328 누락)과 접근로별
+        # regelem 중복 계산 때문에 신뢰 불가 — 경로 기하 vs 교차로 중심
+        # 거리로 세는 방식(route 참조)으로 전환한다.
+        sl_centroid = {rid: (sum(p[0] for p in pts) / len(pts),
+                             sum(p[1] for p in pts) / len(pts))
+                       for rid, pts in tl_stoplines.items()}
+        self.tl_junctions = []             # [(cx, cy)] 신호 교차로 중심들
+        for cx, cy in sl_centroid.values():
+            if not any(math.hypot(cx - gx, cy - gy) < 35.0
+                       for gx, gy in self.tl_junctions):
+                self.tl_junctions.append((cx, cy))
 
         self.parking_lots = {
             wid: pts for wid, pts in self._ways.items()
             if way_tags[wid].get("type") == "parking_lot" and len(pts) >= 3
+        }
+        # parking_space(칸 중심선 2점 way): 맵에서 칸을 옮기면 goal이 따라가도록
+        # 후보 생성 시 lot 폴리곤 안 최근접 칸으로 골을 스냅하는 데 쓴다
+        self.parking_spaces = {
+            wid: pts for wid, pts in self._ways.items()
+            if way_tags[wid].get("type") == "parking_space" and len(pts) >= 2
         }
 
         self._build_graph()
@@ -197,7 +230,16 @@ class MapModel:
         path = [dst]
         while path[-1] != src:
             path.append(prev[path[-1]])
-        n_tl = sum(1 for lid in path if self.lanelets[lid]["has_tl"])
+        # [v4.8] 태그 기반 lanelet 합산은 병행 차선 태그 누락(과소)과 접근로별
+        # regelem 중복(과대)을 모두 앓는다 — 경로 중심선이 신호 교차로 중심
+        # 25m 이내를 지나는 교차로 개수로 센다 (기하 기반, 주석 무관)
+        n_tl = 0
+        for gx, gy in self.tl_junctions:
+            for lid in path:
+                if any(math.hypot(px - gx, py - gy) < 25.0
+                       for px, py in self.lanelets[lid]["center"]):
+                    n_tl += 1
+                    break
         return best[dst][1], best[dst][0], n_tl
 
     # ------------------------------------------------------------- candidates
@@ -316,7 +358,83 @@ class MapModel:
                 #  2.2m 동쪽, 북향. 연석은 costmap min_lidar_height 0.3으로 무시.
                 #  폴리곤은 섬+동측 진입 링까지 커버(in_lot 전환용)]
                 gx2, gy2, yaw_goal = -147.5, 91.9, 1.5708
+            gx2, gy2, yaw_goal = self._space_goal(pts, gx2, gy2, yaw_goal)
             cands.append(Candidate("parking_lot", f"parking_{wid}", gx2, gy2,
                                    yaw_goal, target, parking_sectors))
 
         return cands
+
+    @staticmethod
+    def _point_in_poly(x, y, pts):
+        inside = False
+        j = len(pts) - 1
+        for i in range(len(pts)):
+            xi, yi = pts[i]
+            xj, yj = pts[j]
+            if (yi > y) != (yj > y) and \
+                    x < (xj - xi) * (y - yi) / (yj - yi) + xi:
+                inside = not inside
+            j = i
+        return inside
+
+    def _space_goal(self, poly, gx, gy, yaw):
+        """lot 폴리곤 안의 최근접 parking_space 칸 중심선으로 goal 스냅.
+
+        맵에서 칸을 옮기면 goal이 자동으로 따라간다. yaw는 칸 축의 두 방향 중
+        기존(검증된 nose 관례) yaw에 가까운 쪽. 위치는 footprint(base_link
+        전방 3.83/후방 1.05 m)가 폴리곤의 축 투영 구간 안에 들도록 클램프
+        (여유 0.3 m). 적합 칸이 없거나 클램프 구간이 공집합이면 기존 goal 유지.
+        """
+        best, best_d = None, float("inf")
+        for spts in self.parking_spaces.values():
+            mx = sum(p[0] for p in spts) / len(spts)
+            my = sum(p[1] for p in spts) / len(spts)
+            if not self._point_in_poly(mx, my, poly):
+                continue
+            d = math.hypot(mx - gx, my - gy)
+            if d < best_d:
+                best, best_d = (spts, mx, my), d
+        if best is None:
+            return gx, gy, yaw
+        spts, mx, my = best
+        ax = math.atan2(spts[-1][1] - spts[0][1], spts[-1][0] - spts[0][0])
+
+        def angdiff(a, b):
+            return abs((a - b + math.pi) % (2.0 * math.pi) - math.pi)
+
+        yaw2 = ax if angdiff(ax, yaw) <= angdiff(ax + math.pi, yaw) else ax + math.pi
+        hx, hy = math.cos(yaw2), math.sin(yaw2)
+        # 가용 깊이는 goal 축이 폴리곤 경계와 만나는 실제 교차 구간(코드)으로
+        # 잰다 — 꼭짓점 투영은 비직사각 폴리곤에서 깊이를 과대평가해 앞코가
+        # 경계를 수 cm 넘는 골을 만든다 (1003001 y=69.2 리젝트 실측)
+        t_neg, t_pos = -float("inf"), float("inf")
+        n = len(poly)
+        for i in range(n):
+            x1, y1 = poly[i]
+            x2, y2 = poly[(i + 1) % n]
+            ex, ey = x2 - x1, y2 - y1
+            det = ex * hy - ey * hx
+            if abs(det) < 1e-9:
+                continue
+            dx, dy = x1 - mx, y1 - my
+            t = (ex * dy - ey * dx) / det
+            s = (hx * dy - hy * dx) / det
+            if 0.0 <= s <= 1.0:
+                if t <= 0.0:
+                    t_neg = max(t_neg, t)
+                else:
+                    t_pos = min(t_pos, t)
+        if not math.isfinite(t_neg) or not math.isfinite(t_pos):
+            return gx, gy, yaw
+        fmin = t_neg + 1.05 + 0.35
+        fmax = t_pos - 3.83 - 0.35
+        if fmin > fmax:
+            # 폴리곤 깊이가 근소하게(<0.5 m) 부족하면 구간 중점으로
+            # best-effort 스냅 — 기존 골로의 폴백은 폴리곤이 옮겨진 뒤엔
+            # 오히려 완전히 밖일 수 있다 (1003003 실측). 크게 부족하면 유지.
+            if fmin - fmax < 0.5:
+                off = (fmin + fmax) / 2.0
+                return mx + hx * off, my + hy * off, yaw2
+            return gx, gy, yaw
+        off = min(max(0.0, fmin), fmax)
+        return mx + hx * off, my + hy * off, yaw2

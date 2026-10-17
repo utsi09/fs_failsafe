@@ -97,12 +97,31 @@ public:
         const size_t stride = std::max<size_t>(1, n / 4000);
         double acc = 0.0;
         size_t cnt = 0;
+        // [v4.6] 신형 열화 통계: 근거리 클러터(강수), 원거리 결손(감쇠/오염),
+        // 8-섹터 히스토그램(각도 실명) — 전수 카운트 (스트라이드 아님)
+        size_t n_near = 0, n_far = 0;
+        size_t sect_cnt[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        size_t sect_far[8] = {0, 0, 0, 0, 0, 0, 0, 0};
         auto range_at = [&](size_t i) {
             const uint8_t* p = &msg->data[i * msg->point_step];
             float x, y, z;
             memcpy(&x, p + ox, 4); memcpy(&y, p + oy, 4); memcpy(&z, p + oz, 4);
             return std::sqrt(x * x + y * y + z * z);
         };
+        for (size_t i = 0; i < n; i++) {
+            const uint8_t* p = &msg->data[i * msg->point_step];
+            float x, y, z;
+            memcpy(&x, p + ox, 4); memcpy(&y, p + oy, 4); memcpy(&z, p + oz, 4);
+            if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) continue;
+            const double r = std::sqrt(double(x) * x + double(y) * y + double(z) * z);
+            if (r < 0.5) continue;
+            if (r < 12.0) n_near++;
+            int s = int(std::floor((std::atan2(y, x) + M_PI) / (M_PI / 4.0)));
+            if (s < 0) s = 0;
+            if (s > 7) s = 7;
+            sect_cnt[s]++;
+            if (r > 35.0) { n_far++; sect_far[s]++; }
+        }
         for (size_t i = 0; i + 1 < n; i += stride) {
             const double r1 = range_at(i), r2 = range_at(i + 1);
             if (!std::isfinite(r1) || !std::isfinite(r2) || r1 < 0.5 || r2 < 0.5) continue;
@@ -125,13 +144,76 @@ public:
         if (frames_ < 30) {
             count_baseline_ = count_baseline_ == 0.0 ? double(n_valid)
                                                      : 0.8 * count_baseline_ + 0.2 * n_valid;
-        } else if (n_valid > count_baseline_ * 0.7) {
+        } else if (n_valid > count_baseline_ * 0.95) {
             count_baseline_ = 0.99 * count_baseline_ + 0.01 * n_valid;
         }
-        const double count_score =
+        // [v4.6c] 카운트 샤프 커브: CARLA 라이다 카운트는 ±0.7%로 매우 안정
+        // (nf 실측 46.6k~47.2k) — lso 소실을 카운트 채널로 감지한다.
+        // ratio 0.99+ -> ~1.0, 0.91(lso-mid) -> ~0.49, 0.78(lso-high) -> ~0.07
+        const double count_ratio =
             count_baseline_ > 0 ? std::clamp(n_valid / count_baseline_, 0.0, 1.0) : 1.0;
+        const double cr = std::clamp((count_ratio - 0.7) / 0.3, 0.0, 1.0);
+        const double count_score = cr * cr;
 
+        // [v4.6] 신형 열화 점수 3종 — 베이스라인은 기존 count와 같은 정책
+        // (30프레임 학습, 건강할 때만 천천히 추종, 고장형 급변은 거부)
+        if (frames_ < 30) {
+            near_base_ = near_base_ == 0.0 ? double(n_near)
+                                           : 0.8 * near_base_ + 0.2 * n_near;
+            far_base_ = far_base_ == 0.0 ? double(n_far)
+                                         : 0.8 * far_base_ + 0.2 * n_far;
+            for (int s = 0; s < 8; s++) {
+                sect_base_[s] = sect_base_[s] == 0.0
+                    ? double(sect_cnt[s]) : 0.8 * sect_base_[s] + 0.2 * sect_cnt[s];
+                sect_far_base_[s] = sect_far_base_[s] == 0.0
+                    ? double(sect_far[s]) : 0.8 * sect_far_base_[s] + 0.2 * sect_far[s];
+            }
+        } else {
+            // [v4.6c] 추종 가드 0.95x/1.1x: 고장 수준 변화를 천천히 흡수해
+            // 감지가 무뎌지던 버그 수정 (0.7x는 10 s 만에 고장값 수렴, 실측)
+            if (n_near < near_base_ * 1.1)
+                near_base_ = 0.99 * near_base_ + 0.01 * n_near;
+            if (n_far > far_base_ * 0.9)
+                far_base_ = 0.99 * far_base_ + 0.01 * n_far;
+            for (int s = 0; s < 8; s++) {
+                if (sect_cnt[s] > sect_base_[s] * 0.9)
+                    sect_base_[s] = 0.99 * sect_base_[s] + 0.01 * sect_cnt[s];
+                if (sect_far[s] > sect_far_base_[s] * 0.9)
+                    sect_far_base_[s] = 0.99 * sect_far_base_[s] + 0.01 * sect_far[s];
+            }
+        }
+
+        // 근거리 클러터(강수): r<12 m 포인트가 베이스라인 1.3배 초과분만큼 감점
+        const double clutter_excess = near_base_ > 50
+            ? std::max(0.0, n_near / near_base_ - 1.3) : 0.0;
+        const double clutter_score = std::exp(-clutter_excess / 0.5);
+        // 원거리 결손(감쇠): r>35 m 포인트 잔존율. 0.7x 슬랙 — 장면 변화
+        // (개활지->시가지)의 자연 변동에 오탐하지 않게 30% 여유
+        const double far_score = far_base_ > 200
+            ? std::clamp(n_far / (0.7 * far_base_), 0.0, 1.0) : 1.0;
+        // 섹터 결손(각도 실명): 최악 섹터 잔존율. 총카운트는 근거리 지면점이
+        // 지배해 섹터 거리붕괴를 못 봐서(v4.6b 실측 worst 0.97), 방향별
+        // "원거리(r>35m) 카운트" 잔존율로 판정 — 섹터 range collapse 직접 측정.
+        // 총카운트 판정은 완전 실명(섹터 전멸)용 보조로 유지.
+        double sector_score = 1.0;
+        for (int s = 0; s < 8; s++) {
+            if (sect_far_base_[s] > 150)
+                sector_score = std::min(
+                    sector_score,
+                    std::clamp(sect_far[s] / (0.7 * sect_far_base_[s]), 0.0, 1.0));
+            if (sect_base_[s] > 300)
+                sector_score = std::min(
+                    sector_score,
+                    std::clamp(sect_cnt[s] / (0.7 * sect_base_[s]), 0.0, 1.0));
+        }
+
+        // [v4.6c] far/섹터 감지기는 장면 의존(개활지·울타리 오탐)이라 quality에서
+        // 제외 — 로그 관측용으로만 유지. lso는 카운트 샤프커브, lcl은 클러터+
+        // 시그마 채널이 담당 (둘 다 장면 강건 실측)
         double quality = std::clamp(noise_score * count_score, 0.0, 1.0);
+        quality = std::min(quality, clutter_score);
+        (void)far_score;
+        (void)sector_score;
 
         // CUSUM 순차검정: exp() 점수와 병행. sigma의 baseline 초과분에서 슬랙 k를
         // 뺀 값을 S=max(0,S+excess-k)로 누적 — 작은 고장도 시간이 지나면 h를
@@ -150,7 +232,10 @@ public:
         publish(quality, true);
         cout << name() << " quality: " << quality << " (sigma " << sigma_est
              << "m, base " << baseline_ << "m, pts " << n_valid << "/" << n
-             << ", cusum " << cusum_s_ << ")" << endl;
+             << ", cusum " << cusum_s_
+             << ", near " << n_near << "/" << int(near_base_)
+             << ", far " << n_far << "/" << int(far_base_)
+             << ", worst_sect " << sector_score << ")" << endl;
         return BT::NodeStatus::SUCCESS;
     }
 
@@ -170,6 +255,10 @@ private:
     std::mutex mtx_;
     double baseline_ = 0.0;
     double count_baseline_ = 0.0;
+    double near_base_ = 0.0;
+    double far_base_ = 0.0;
+    double sect_base_[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    double sect_far_base_[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     int frames_ = 0;
     uint64_t last_stamp_ns_ = 0;
     bool has_prev_stamp_ = false;

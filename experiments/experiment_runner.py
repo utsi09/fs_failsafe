@@ -16,6 +16,7 @@ Usage:
 import argparse
 import csv
 import itertools
+import json
 import math
 import os
 import signal
@@ -51,7 +52,9 @@ LEADERBOARD_CMD = ("cd /home/taewook/autoware_carla_leaderboard && "
 CDR_CMD = "cd ~/fs_ws && source install/setup.bash && CDR_DEMO_NO_ERROR=1 ros2 launch cdr_monitor cdr_monitor_awcl.launch.py"
 DUMP_CMD = ("source ~/autoware_awcl/autoware/install/setup.bash && "
             "ros2 run autoware_diagnostic_graph_utils dump_node")
-SUP_CMD = ("cd ~/fs_ws && source install/setup.bash && "
+# [v4.9k] autoware install 선소스: tier4_planning_msgs(속도 캡 메시지) 확보
+SUP_CMD = ("source ~/autoware_awcl/autoware/install/setup.bash >/dev/null 2>&1; "
+           "cd ~/fs_ws && source install/setup.bash && "
            "ros2 launch mrm_supervisor mrm_supervisor.launch.py baseline:={baseline}")
 
 AUTOWARE_READY_NODE = "behavior_path_planner"
@@ -82,6 +85,7 @@ HAZARD_STOP_S = 60.0
 # verdicts). ~1 min/restart is cheaper than a wasted 7-min case, and a fresh
 # world per case is better experimental hygiene anyway (no leftover actors).
 CARLA_RESTART_EVERY = 1
+DEST_XY = None   # [v4.7] --dg 목적지 (x, y) — 완주 근사 판정용 (main에서 설정)
 
 # ---------------------------------------------------------------- case matrix
 # per-fault severity values (units differ: ln meters, cn pixel sigma 0-255,
@@ -89,19 +93,35 @@ CARLA_RESTART_EVERY = 1
 SEVERITY = {
     "ln":  {"mid": 0.3,  "high": 0.6},
     "cn":  {"mid": 15.0, "high": 30.0},
-    "imn": {"mid": 0.05, "high": 0.15},
+    # [v4.6h] imn 재보정: 감지기(EKF innovation EMA)가 느려 0.05→det 210s,
+    # 0.15→171s = 미션長 초과 -> 실질 미감지. 0.5→53.6s (프로브 실측). mid는
+    # "미션 내 감지 가능" 원칙에 맞춘 스트레스 강도로 문서화.
+    "imn": {"mid": 0.5, "high": 1.5},
     "gn":  {"mid": 1.0,  "high": 2.5},
     "imb": {"mid": 0.3,  "high": 1.0},   # v2: 자이로 바이어스 [rad/s]
     "imd": {"mid": 0.005, "high": 0.02},  # 자이로 바이어스 램프(드리프트) [rad/s^2]
                                           # mid: 60s에 imb-mid 수준 도달, high: 15s
+    # [v4.6] 현실형 라이다 열화 2종 (2026-08-12 문헌조사: 현실 빈도 1·2위 유형,
+    # 물리 파라미터화 — lso: 커버투과율T:섹터폭deg (Trierweiler/Goodin),
+    # lcl: 강우량mm/h:클러터점수 (Beer-Lambert alpha=0.01*Rr^0.6, LISA 클러터))
+    # lso T 보정(v4.6b): 섹터-far 감지기 기준 역산 — mid 유효거리 ~55m(전방 원거리
+    # 절반 잔존 -> 게이트 통과, 이동 MRC), high ~12m(전방 실명 -> DEFER).
+    # CARLA intensity가 재질 무시(~e^-0.004d)라 문헌 T와 절대값은 다름
+    "lso": {"mid": "0.33:90", "high": "0.07:150"},
+    "lcl": {"mid": "5:1500", "high": "25:4000"},
+    # [gm] GNSS Gauss-Markov 상관편향: sigma[m]:tau[s] — 멀티패스/NLOS의
+    # 시간상관 오차 (Langel'21 GM 모델, Bhatti'07 느린오차=최악). EXTRA 폴트.
+    "gm": {"mid": "3.0:30", "high": "8.0:30"},
 }
 SEV_LEVELS = ["mid", "high"]
 # ln: BOTH lidars noise; cn: camera noise; imn: IMU noise; gn: GNSS/EKF pose
 # noise; cf: camera destroyed; lf: front lidar destroyed; nf: no-fault control
-FAULT_KINDS = ["ln", "cn", "imn", "gn", "cf", "lf", "nf"]
+FAULT_KINDS = ["cn", "imn", "gn", "lso", "lcl", "cf", "lf", "nf"]
 # v2 추가 고장: imb=자이로 바이어스, rain=폭우 프리셋, gb=GNSS 블랙아웃.
 # 기본 매트릭스에는 넣지 않고 --fault 로 명시 선택했을 때만 실행된다.
-EXTRA_FAULT_KINDS = ["imb", "imd", "rain", "gb", "cfl", "mix", "cfl2", "lfl2"]
+EXTRA_FAULT_KINDS = ["ln", "gm", "imb", "imd", "rain", "gb", "cfl", "mix", "cfl2", "lfl2"]
+# [v4.6] ln(가우시안 반경노이즈)은 본 매트릭스에서 제외 — 현실 대표성 낮음
+# (문헌: 지터는 실제 열화의 최소 성분). lso/lcl이 대체, ln은 ablation용 EXTRA.
 NO_SEVERITY = {"cf", "lf", "nf", "rain", "gb", "cfl", "mix", "cfl2", "lfl2"}  # no severity dimension (nf: no trigger either)
 # fault time is a RANDOM COVARIATE, not a matrix dimension: fixed trigger
 # times pinned the fault to the same spots so the supervisor always picked
@@ -211,6 +231,11 @@ class Procs:
         # force domain 0 regardless of the env baked into the container;
         # -u matches the user of the manual (working) terminals
         full = ["docker", "exec", "-e", "ROS_DOMAIN_ID=0"]
+        # [v5 절제] 시드 env 패스스루 — 오케스트레이터가 케이스별로 설정
+        for _sk in ("FAULT_SEED", "FAULT_TRACE", "WALKER_SEED", "CASE_TAG", "DETECT_CAP", "FREEZE_TL"):
+            _sv = os.environ.get(_sk)
+            if _sv:
+                full += ["-e", f"{_sk}={_sv}"]
         if user:
             full += ["-u", user]
         full += [container, "bash", "-lc", cmd]
@@ -252,7 +277,7 @@ class Procs:
         # (observed: 4 stacked autoware instances -> map never loads).
         for container, pats in [
             (LB_CONTAINER, ["ros-args", "leaderboard_evaluator", "ros2 launch",
-                            "run_leaderboard"]),
+                            "run_leaderboard", "tl_v2x_relay", "hazard_injector"]),
             (AW_CONTAINER, ["ros-args", "component_container", "robot_state_publisher",
                             "rviz2", "ros2 launch"]),
         ]:
@@ -263,8 +288,10 @@ class Procs:
         # dump_node included: orphaned dump instances duplicate the node name ->
         # duplicated_node_checker ERROR -> every mode unavailable -> permanent
         # emergency stop (three strays found blocking departure, 0731)
+        # dummy_defer 추가(0815 실측): 러너 강제종료가 남긴 dummy_defer 2마리가
+        # 같은 노드명으로 떠서 duplicated_node_checker ERROR -> 전 케이스 출발불가
         for pat in ["cdr_monitor", "mrm_supervisor", "awcl_adapter", "ros2 launch",
-                    "diagnostic_graph_utils dump_node"]:
+                    "diagnostic_graph_utils dump_node", "dummy_defer"]:
             subprocess.run(["pkill", "-9", "-f", pat], capture_output=True)
         # the pattern above only matches the `ros2 run` wrapper; killing it -9
         # orphans the actual dump_node binary (path has a slash, not a space),
@@ -299,7 +326,10 @@ def carla_alive():
 
 
 CARLA_DIR = "/home/taewook"          # CarlaUE4.sh lives here, launched as ./CarlaUE4.sh
-CARLA_LAUNCH = "cd /home/taewook && ./CarlaUE4.sh --ros2"
+# [0813 밤] 모니터 전원 분리로 X 출력 0개 -> UE4가 창 초기화 세그폴트 반복
+# (carla_archive.log Signal=11 연쇄, lcl 141/180 조기종료의 원인). 헤드리스
+# 렌더링이면 디스플레이 유무와 무관 — 센서 캡처는 동일하게 렌더된다.
+CARLA_LAUNCH = "cd /home/taewook && ./CarlaUE4.sh --ros2 -RenderOffScreen"
 CARLA_CHECK_CMD = ("cd /home/taewook/autoware_carla_leaderboard && "
                    "source carla_envs.sh >/dev/null 2>&1; "
                    "python3 -c \"import carla; c=carla.Client('localhost',2000); "
@@ -385,6 +415,25 @@ def autoware_ready(dry, timeout=AUTOWARE_READY_TIMEOUT):
     return False
 
 
+POST_MRC_OBS_S = 110.0   # 정차 후 관측창(판정 전 10 s 유량 관측과 합쳐 ~120 s)
+
+
+def post_mrc_observe(window_s):
+    """정차 후 NPC 상충 대리 지표(급감속·근접통과·min TTC) 계측 — carla 클라이언트."""
+    try:
+        r = subprocess.run(
+            ["bash", "-lc",
+             "cd /home/taewook/autoware_carla_leaderboard && "
+             "source carla_envs.sh >/dev/null 2>&1; "
+             f"python3 experiments/post_mrc_observe.py {window_s:.0f}"],
+            capture_output=True, text=True, timeout=window_s + 30.0)
+        line = r.stdout.strip().splitlines()[-1] if r.stdout.strip() else "{}"
+        return json.loads(line)
+    except Exception as e:
+        print(f"[judge] post-MRC observe failed: {e}")
+        return {}
+
+
 def capture_stall_factor():
     """STUCK/DEFER 원인 추적: 확정 직전 velocity factor의 behavior를 1회 캡처."""
     try:
@@ -431,6 +480,9 @@ class Judge:
         self.aw_state = 0              # MrmState.state from mrm_handler
         self.aw_behaviors = []         # behavior names in first-seen order
         self.fault_time = None         # wall time the fault went live
+        self.fault_time_sim = None     # sim time (/clock) the fault went live
+        self.state_times_sim = {}      # state -> first-seen sim time
+        self.sim_now = None            # latest /clock [s]
         self.deg_dist = 0.0            # meters driven after the fault
         self.min_gap = None            # nearest obstacle while stationary post-fault
         self._last_xy = None
@@ -438,6 +490,8 @@ class Judge:
         self._obs_samples = []
         self.traffic = ""              # cleared / blocked after the stop
         self.stall_factor = ""         # STUCK/DEFER 시점의 정지 요인 (v2)
+        self.npc_style = ""            # 관측창 게이트용 (none 은 상충 정의상 0)
+        self.obs = {}                  # post-MRC 관측창 대리 지표 (v4)
 
         self.node.create_subscription(
             String, "/mrm_supervisor/state", self._state_cb,
@@ -453,18 +507,26 @@ class Judge:
             OperationModeState, "/api/operation_mode/state", self._op_cb,
             QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         from std_msgs.msg import Bool, Float64
+        from rosgraph_msgs.msg import Clock
         self.node.create_subscription(
             Bool, "/fault_injection/active", self._fault_cb,
             QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self.node.create_subscription(
             Float64, "/monitor/nearest_obstacle_m", self._gap_cb, 10)
+        # [0822] 심시간 지연 측정: destroy 히치 동안 /clock이 멈추므로
+        # 벽시계 지연은 히치를 포함해 과대측정된다 — 안전 지연은 심시간 병기
+        self.node.create_subscription(Clock, "/clock", self._clock_cb, 10)
 
         self._spin = threading.Thread(target=self._spin_loop, daemon=True)
         self._spin.start()
 
+    def _clock_cb(self, msg):
+        self.sim_now = msg.clock.sec + msg.clock.nanosec * 1e-9
+
     def _fault_cb(self, msg):
         if msg.data and self.fault_time is None:
             self.fault_time = time.time()
+            self.fault_time_sim = self.sim_now
             print("[judge] fault active")
 
     def _gap_cb(self, msg):
@@ -499,6 +561,8 @@ class Judge:
         if msg.data != self.state:
             self.state = msg.data
             self.state_times.setdefault(msg.data, time.time())
+            if self.sim_now is not None:
+                self.state_times_sim.setdefault(msg.data, self.sim_now)
             print(f"[judge] supervisor state: {msg.data}")
 
     AW_BEHAVIOR_NAMES = {2: "EMERGENCY_STOP", 3: "COMFORTABLE_STOP", 4: "PULL_OVER"}
@@ -595,6 +659,14 @@ class Judge:
                         gend = sum(smp[-3:]) / len(smp[-3:])
                         self.traffic = ("blocked" if gend < 12.0 and gend - gmin < 3.0
                                         else "cleared")
+                    # [v4 관측창] 정차 후 NPC 상충 대리 지표 — 트래픽이 있는
+                    # 케이스만(none 은 정의상 0). AgentBlocked 600 s 이내라
+                    # 시나리오는 계속 살아 있다.
+                    if not lb_dead and self.npc_style in ("def", "agg", "low", "high"):
+                        win = min(POST_MRC_OBS_S, max(0.0, CASE_TIMEOUT_S - 20.0 - elapsed))
+                        if win > 20.0:
+                            print(f"[judge] post-MRC observation {win:.0f} s")
+                            self.obs = post_mrc_observe(win)
                     return verdict, self._detail()
                 time.sleep(1.0)
                 continue
@@ -614,6 +686,13 @@ class Judge:
                 return "SCENARIO_ENDED", self._detail()
             if (self.moved and self.state in ("", "NORMAL")
                     and stationary_for > JUNCTION_STUCK_S):
+                # [v4.7] 목적지 30m 이내 정지 = 사실상 완주. dg 지점(-102,95)의
+                # 도착 pull-over가 goal_planner "0 candidates"로 만성 실패(7/31
+                # 부터 전 배터리 동일)라 24m 앞 정지가 STUCK으로 오분류되던 것 —
+                # 임무 수행은 끝났고 마지막 기동만 맵 특이점이므로 완주로 판정.
+                if self.pose is not None and DEST_XY is not None \
+                        and math.dist(self.pose, DEST_XY) <= 30.0:
+                    return "ROUTE_COMPLETE_NEAR", self._detail()
                 self.stall_factor = capture_stall_factor()   # 확정 직전 1회 (v2)
                 return "STUCK_AT_JUNCTION", self._detail()
             if self.state.startswith("MRM_MOVE") and stopped_for > (
@@ -699,26 +778,38 @@ class Judge:
                       if s_.startswith("MRM_MOVE")), default=None)
         t_end = self.stopped_since or time.time()
         tts = (t_end - t_move) if t_move else float("nan")
-        det, tts_fault = "", ""
+        det, tts_fault, det_sim = "", "", ""
         if self.fault_time is not None:
             mrm_ts = [t for s_, t in self.state_times.items()
                       if s_.startswith("MRM_") and t >= self.fault_time - 1.0]
             if mrm_ts:
                 det = round(min(mrm_ts) - self.fault_time, 1)
+            if self.fault_time_sim is not None:
+                mrm_sim = [t for s_, t in self.state_times_sim.items()
+                           if s_.startswith("MRM_") and t >= self.fault_time_sim - 1.0]
+                if mrm_sim:
+                    det_sim = round(min(mrm_sim) - self.fault_time_sim, 2)
             if self.stationary_since is not None:
                 tts_fault = round(self.stationary_since - self.fault_time, 1)
         return {"final_state": self.state, "x": round(px, 1), "y": round(py, 1),
                 "time_to_stop_s": round(tts, 1) if not math.isnan(tts) else "",
-                "det_latency_s": det, "tts_fault_s": tts_fault,
+                "det_latency_s": det, "det_latency_sim_s": det_sim, "tts_fault_s": tts_fault,
                 "deg_dist_m": round(self.deg_dist, 1) if self.fault_time else "",
                 "min_gap_m": round(self.min_gap, 1) if self.min_gap is not None else "",
                 "traffic": self.traffic,
                 "stall_factor": self.stall_factor,
-                "aw_mrm": "+".join(self.aw_behaviors)}
+                "aw_mrm": "+".join(self.aw_behaviors),
+                "obs_hard_decel": self.obs.get("obs_hard_decel", ""),
+                "obs_pass_events": self.obs.get("obs_pass_events", ""),
+                "obs_min_pass_gap_m": self.obs.get("obs_min_pass_gap_m", ""),
+                "obs_min_ttc_s": self.obs.get("obs_min_ttc_s", ""),
+                "obs_npc_seen": self.obs.get("obs_npc_seen", ""),
+                "obs_window_s": self.obs.get("obs_window_s", "")}
 
     def reset(self):
         self.state = ""
         self.state_times.clear()
+        self.state_times_sim.clear()
         self.pose = None
         self.speed = None
         self.stopped_since = None
@@ -728,11 +819,13 @@ class Judge:
         self.aw_behaviors = []
         self.op_mode = None
         self.fault_time = None
+        self.fault_time_sim = None
         self.deg_dist = 0.0
         self.min_gap = None
         self._last_xy = None
         self._obs_start = None
         self._obs_samples = []
+        self.obs = {}
         self.traffic = ""
         self.stall_factor = ""
 
@@ -827,7 +920,9 @@ def archive_case_logs(idx, case, dry):
     # (cfl ablation에서 fixed 런 로그가 dynamic 런에 덮인 사고, 0803)
     run_tag = datetime.now().strftime("%m%d_%H%M")[:9]
     dst = OUT_DIR / "case_logs" / f"{run_tag}_{idx}_{case['method']}_{case['fault']}"
-    for name in ("cdr", "supervisor"):
+    # autoware.log 포함: 행동계획기 동결(빈 궤적) 부검에 필요 (8/11 1003003 실측 —
+    # 다음 케이스가 로그를 잘라 사인 유실)
+    for name in ("cdr", "supervisor", "autoware"):
         src = OUT_DIR / f"{name}.log"
         try:
             if not src.exists():
@@ -869,9 +964,11 @@ def run(args):
         wr.writerow(["idx", "method", "fault", "severity", "trigger_s", "npc", "rep",
                      "outcome", "final_state", "aw_mrm", "stop_x", "stop_y",
                      "lane_overlap_m", "lane_block_pct",
-                     "det_latency_s", "tts_fault_s", "deg_dist_m", "min_gap_m", "traffic",
+                     "det_latency_s", "det_latency_sim_s", "tts_fault_s", "deg_dist_m", "min_gap_m", "traffic",
                      "time_to_stop_s", "collisions", "collision_types",
-                     "stall_factor", "t_hazard_s", "wall_s"])   # v2 열 2종
+                     "stall_factor", "t_hazard_s", "wall_s",
+                     "obs_hard_decel", "obs_pass_events", "obs_min_pass_gap_m",
+                     "obs_min_ttc_s", "obs_npc_seen", "obs_window_s"])  # v4 관측창
         interrupted = False
         for i, case in enumerate(cases):
             if interrupted:
@@ -892,6 +989,7 @@ def run(args):
                 procs.kill_all()
                 if judge:
                     judge.reset()
+                    judge.npc_style = case["npc"]
                 RESULTS_JSON.unlink(missing_ok=True)
 
                 procs.docker_bg(LB_CONTAINER, BRIDGE_CMD, "bridge")
@@ -916,13 +1014,24 @@ def run(args):
                     # -> 출발 불가. cdr은 정상 기동(점수만 낼 뿐 개입 없음),
                     # supervisor 유닛은 더미 OK 발행으로 그래프만 만족시킨다.
                     procs.host_bg(cdr_cmd, "cdr")
-                    procs.host_bg(
-                        "export ROS_DOMAIN_ID=0; "
-                        "export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp; "
-                        "export CYCLONEDDS_URI=/home/taewook/cyclone_localhost.xml; "
-                        "source /opt/ros/humble/setup.bash && "
-                        "python3 /home/taewook/autoware_carla_leaderboard/experiments/dummy_defer.py",
-                        "dummy_defer")
+                    # [v5 절제] SUP_SHADOW=1: A1(native)에도 진짜 supervisor를
+                    # 섀도(전이만·무행동)로 — 4팔 동일 감지기로 t_detect 동등화.
+                    # 섀도가 defer_request OK를 계속 내므로 더미는 생략.
+                    if os.environ.get("SUP_SHADOW") == "1":
+                        procs.host_bg(
+                            "export SUP_SHADOW=1; "
+                            + SUP_CMD.format(baseline="false"), "supervisor")
+                        _shadow_sup = True
+                    else:
+                        _shadow_sup = False
+                    if not _shadow_sup:
+                        procs.host_bg(
+                            "export ROS_DOMAIN_ID=0; "
+                            "export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp; "
+                            "export CYCLONEDDS_URI=/home/taewook/cyclone_localhost.xml; "
+                            "source /opt/ros/humble/setup.bash && "
+                            "python3 /home/taewook/autoware_carla_leaderboard/experiments/dummy_defer.py",
+                            "dummy_defer")
                 # --mrm-off: 모니터·MRM 개입 없이 고장 진행만 관찰 (FTTI 도출)
                 # per-unit graph levels — to identify which unit flaps the MRM
                 procs.host_bg(DUMP_CMD, "diag_dump")
@@ -930,6 +1039,40 @@ def run(args):
                                      LEADERBOARD_CMD.format(
                                          faults=fault_args(case, args.dg)),
                                      "leaderboard")
+                # [v4.6g] V2X 신호등 릴레이 — agent 프로세스의 rclpy가
+                # TrafficLightGroupArray 발행을 wire에 못 싣는 문제(0812)를
+                # 독립 프로세스로 우회. 카메라-폴트 케이스는 카메라 인식 유지.
+                if case["fault"] not in ("cf", "cn", "cfl", "cfl2", "mix"):
+                    procs.docker_bg(
+                        LB_CONTAINER,
+                        "source /opt/ros/humble/setup.bash && "
+                        "source /home/taewook/autoware_carla_leaderboard/install/setup.bash && "
+                        "python3 /home/taewook/autoware_carla_leaderboard/experiments/tl_v2x_relay.py",
+                        "tl_relay")
+                # [v4.9] 엣지 케이스 주입기 (HAZARD=ped=5:22:3 식) — tl_relay와
+                # 같은 독립 프로세스 패턴. env 미설정이면 완전 무동작.
+                _hz = os.environ.get("HAZARD", "")
+                if _hz:
+                    _hmode, _hspec = _hz.split("=", 1)
+                    procs.docker_bg(
+                        LB_CONTAINER,
+                        "cd /home/taewook/autoware_carla_leaderboard && "
+                        "source /opt/ros/humble/setup.bash && "
+                        "source install/setup.bash && "
+                        "source carla_envs.sh >/dev/null 2>&1; "
+                        # --spec=값 형태 필수: shoulder 좌표가 음수로 시작하면
+                        # argparse가 옵션으로 오파싱 (0815 실측: 블로커 전원 미스폰)
+                        # until 래퍼: 케이스 초반 월드 로드 레이스에서 CARLA 클라가
+                        # C++ terminate로 즉사(0816 실측: 로그 0바이트) — 성공(정상
+                        # 종료)까지 2 s 간격 재기동. cleanup pkill이 래퍼도 잡는다.
+                        # [sd 0827] 오케스트레이터가 CASE_TAG를 미리 주면 존중
+                        # (docker_bg -e 패스스루) — 시드x조건 배치의 산출물 귀속용
+                        f"export CASE_TAG=${{CASE_TAG:-{case['fault']}-{case['sev']}-"
+                        f"{case['method']}{'-off' if args.mrm_off else ''}-r{case['rep']}}}; "
+                        "until python3 experiments/hazard_injector.py "
+                        f"--mode={_hmode} --spec={_hspec} --fault-t={case['t']}; "
+                        "do sleep 2; done",
+                        "hazard")
                 if not ego_alive(args.dry):
                     raise RuntimeError("ego odometry never appeared")
                 if args.dry:
@@ -957,13 +1100,16 @@ def run(args):
                    case["npc"], case["rep"],
                    outcome, detail.get("final_state", ""), detail.get("aw_mrm", ""),
                    sx, sy, ov, pct,
-                   detail.get("det_latency_s", ""), detail.get("tts_fault_s", ""),
+                   detail.get("det_latency_s", ""), detail.get("det_latency_sim_s", ""), detail.get("tts_fault_s", ""),
                    detail.get("deg_dist_m", ""), detail.get("min_gap_m", ""),
                    detail.get("traffic", ""),
                    detail.get("time_to_stop_s", ""),
                    n_coll, coll_types,
                    detail.get("stall_factor", ""), detail.get("t_hazard_s", ""),
-                   wall]
+                   wall,
+                   detail.get("obs_hard_decel", ""), detail.get("obs_pass_events", ""),
+                   detail.get("obs_min_pass_gap_m", ""), detail.get("obs_min_ttc_s", ""),
+                   detail.get("obs_npc_seen", ""), detail.get("obs_window_s", "")]
             wr.writerow(row)
             f.flush()
             print(f"[runner] result: {outcome} ({wall}s)")
@@ -1012,4 +1158,10 @@ if __name__ == "__main__":
     ap.add_argument("--no-log-archive", action="store_true",
                     help="케이스별 cdr/supervisor 로그 gzip 보관을 끈다")
     args = ap.parse_args()
+    try:
+        if args.dg and args.dg not in ("", "1"):
+            _p = args.dg.split(":")
+            DEST_XY = (float(_p[0]), float(_p[1]))
+    except (ValueError, IndexError):
+        DEST_XY = None
     run(args)
