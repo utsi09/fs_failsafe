@@ -63,8 +63,35 @@
 
 밤 하나로 1~4(115회 ≈ 12 h)가 끝나고, 낮에 5~7(31회 ≈ 3.5 h)이 이어진다. 밤 시작을 저녁 6시로 잡으면 다음 날 오후 2시쯤 전부 끝난다.
 
+**주입 모델이 예측하는 최대 검출 거리** (lidar_bridge.cpp 의 문턱 P_min = 0.9/(π·100²), CARLA 강도 ≈ e^(−0.004 r), lcl 은 e^(−2αr) 왕복 감쇠, lso 는 섹터 안 강도 × T²). 검출기(CenterPoint)의 D_det 는 이 값 **이하**로 나와야 정상이다(점 몇 개로는 객체를 못 만드니까). 두 스윕 모두 26 m 판단 창을 가로지르도록 짜여 있다.
+
+| lcl mm/h | 0 | 1 | 2 | 5 (mid) | 10 | 15 | 25 (high) | 40 |
+|---|---|---|---|---|---|---|---|---|
+| α [1/m] | 0 | 0.010 | 0.015 | 0.026 | 0.040 | 0.051 | 0.069 | 0.092 |
+| 가시거리 환산 ≈ 3/α [m] | ∞ | 300 | 200 | 114 | 75 | 59 | 43 | 33 |
+| 점이 남는 최대 거리 [m] | 100 | 76 | 63 | 48 | 38 | 33 | **27** | 23 |
+
+| lso T | 1.0 | 0.8 | 0.6 | 0.45 | 0.33 (mid) | 0.25 | 0.2 | 0.15 | 0.12 | 0.07 (high) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 섹터 안 최대 거리 [m] | 100 | 100 | 93 | 73 | **55** | 43 | 35 | 27 | 21 | **13** |
+
+lcl-high(25 mm/h)가 "근거리만 보였다"는 기억이 맞다: 모델상 27 m 밖의 점은 전부 사라진다. 이는 26 m 판단 창의 바로 끝이라 lcl-high 개입은 "여유 0"으로 정당화된다. Kim 2023 실측(40 mm/h 에서 20~30 m 부터 비관측)과도 맞는다. lso 의 55 m / 13 m 는 논문 본문의 "mid ≈ 55 m, high ≈ 12 m" 그대로.
+
 줄여야 하면 뒤에서부터 자른다: B2(−9) → A2(−10) → A1의 0.8·0.15(−10) → lcl 1·15(−10) = 107회.
 결과가 경계에 걸린 수준(예: 점수가 0.7 바로 위/아래)은 그 수준만 rep 8로 보충(+3회/수준)한다.
+
+### 3-1. GNSS 노이즈(gn)가 실제로 건드리는 것 — 이 Autoware 설정 기준
+
+`/sensing/gnss/pose_with_covariance` 를 읽는 곳은 셋뿐이다 (launch 파일 grep 결과):
+1. **pose_initializer** (`gnss_enabled`): 시동 때 NDT 초기 정렬 위치를 GNSS 로 잡는다. 주행 중 NDT 가 놓쳐서 **재초기화**할 때도 이걸 쓴다.
+2. **ndt_scan_matcher 의 GNSS 정규화**: 특징 없는 구간에서 NDT 를 GNSS 쪽으로 당기는 기능. **이 설정에서는 꺼져 있음**.
+3. eagleye 설정 파일: 사용 안 함.
+
+그러므로 주행 중 gn 은 Autoware 의 EKF·계획·제어에 **아무 영향이 없다**. 영향이 있는 경우는 (a) NDT 가 무너져 재초기화할 때 → 2.5 m 틀린 자리에서 NDT 를 다시 맞추기 시작해 엉뚱한 곳에 수렴할 수 있음, (b) GNSS 정규화를 켠 설정, (c) GNSS/INS 가 pose source 인 차량(PCD 맵 없이 RTK 로 측위하는 경우) → 그때는 EKF 에 바로 들어가 위치가 튀고 경로·제어가 흔들린다. 실차(아이오닉6, RTK GPS)가 (c) 구성이면 gn 은 가장 직접적인 고장이다.
+
+논문에서 gn 의 자리: "GNSS 입력 무결성 고장". 감시기의 loc_meas 는 EKF 가 아니라 **GNSS 가 믿을 만한가**를 재고, gn-high 에서 정지로 분기하는 것은 "재초기화·정규화에 쓸 GNSS 를 잃었으니 이동을 포기"하는 보수적 정책이다. Autoware 자체 감시기(localization_error_monitor: EKF 공분산 타원 횡 0.25 m 경고 / 0.3 m 오류, pose_instability_detector)는 GNSS 를 보지 않으므로 이 고장을 못 잡는다 — 5.2절 "gn-high 로 251 m 주행"의 기전.
+
+**선택 블록 B3 (gn 이 EKF 에 들어가면 어떻게 되나, 6회)**: pose_twist_fusion_filter.launch.xml 의 `input_pose_with_cov_name` 을 `/sensing/gnss/pose_with_covariance` 로 바꾼 launch 로 Autoware 를 띄우면 GNSS 가 EKF 의 pose source 가 된다(NDT 출력은 무시됨). gn 1.0·2.5 × 3 회. 결과: e_lat P95 가 σ 에 비례해 커지고 cap_loc 교차와의 관계를 직접 볼 수 있다. 주의: 에이전트 GNSS pose 는 base_link 대비 1.4 m 오프셋이 있어 nf 에서도 차가 차로 안에서 치우칠 수 있다 → 먼저 nf 1회로 정상 주행이 되는지 확인하고, 안 되면 B3 은 뺀다. 이 블록은 "구성 (c) 차량이라면"이라는 가정 아래의 보조 결과로만 쓴다.
 
 ## 4. 기록할 것 (추가할 코드 4개)
 
@@ -136,7 +163,7 @@ EKF(`kinematic_state`) vs GT. 고정 오프셋(≈1.4 m)은 각 실행의 고장
 
 | 지표 | 정의 | 왜 |
 |---|---|---|
-| **e_lat P95** | 경로 중심선 기준 횡방향 EKF 오차 95퍼센타일 | 차로 유지에 직접 관련. 차로 3.5 m, 차폭 1.9 m → 여유 0.8 m. **0.5 m를 "이동 가능" 기준선**으로 둔다. 문헌 기준선도 같이 표시: Reid 2019 의 로컬도로 횡방향 경보한계 0.29 m(95 % 0.10 m), 고속도로 0.57 m(0.20 m). 0.5 m 는 둘 사이이고 저속(3 m/s) 대피라는 점으로 정당화 |
+| **e_lat P95** | 경로 중심선 기준 횡방향 EKF 오차 95퍼센타일 | 차로 유지에 직접 관련. 차로 3.5 m, 차폭 1.9 m → 여유 0.8 m. **0.5 m를 "이동 가능" 기준선**으로 둔다. 문헌 기준선도 같이 표시: Reid 2019 의 로컬도로 횡방향 경보한계 0.29 m(95 % 0.10 m), 고속도로 0.57 m(0.20 m). 0.5 m 는 둘 사이이고 저속(3 m/s) 대피라는 점으로 정당화. Autoware 자체 localization_error_monitor 의 횡방향 타원 기준(경고 0.25 m / 오류 0.3 m, 공분산 기준이라 실제 오차와는 다른 양)도 각주로 |
 | e_pos RMSE / P95 | 위치 오차 | 보조 |
 | e_yaw P95 | 요 오차 | imn에 민감 |
 | NDT TP / NVTL 중앙값 | NDT 자체 신뢰도 | lso/lcl이 NDT에 주는 타격 |
@@ -216,7 +243,7 @@ EKF(`kinematic_state`) vs GT. 고정 오프셋(≈1.4 m)은 각 실행의 고장
 | 문헌 | 방법 | 우리가 빌리는 것 |
 |---|---|---|
 | Hendrycks & Dietterich, ICLR 2019 (ImageNet-C) | 손상 유형 × 심각도 1~5 단계, 기준 모델 대비 상대 오류 | "심각도 단계 스윕"이라는 실험 형식 자체 |
-| **Dong et al., CVPR 2023** "Benchmarking Robustness of 3D Object Detection to Common Corruptions" | LiDAR·카메라 27종 손상 × 5단계. LiDAR fog α ∈ {0.005, 0.01, 0.02, 0.03, 0.06}, rain/snow 강도 {0.2…7.29}, density decrease {6…30 %}. 지표 AP_cor = 손상·단계 평균 AP, **RCE = (AP_clean − AP_cor)/AP_clean** | ① RCE 정의 그대로 가져와 R_h·D_det 에 적용. ② 우리 lcl 의 Beer-Lambert α = 0.01·R^0.6 는 5 mm/h → 0.026, 25 mm/h → 0.069, 40 mm/h → 0.091 로 Dong 의 fog 단계 3~5 와 같은 α 범위다. 표에 "Dong 심각도 환산" 열을 넣으면 우리 mid/high 가 문헌에서 어느 단계인지 한눈에 보인다. ③ lso 의 sector dropout 은 Dong 의 "FOV lost"(각도 범위 축소)·"local density decrease" 와 같은 종류 — 관련 문장에 인용 |
+| **Dong et al., CVPR 2023** "Benchmarking Robustness of 3D Object Detection to Common Corruptions" | LiDAR·카메라 27종 손상 × 5단계. LiDAR fog α ∈ {0.005, 0.01, 0.02, 0.03, 0.06}, rain/snow 강도 {0.2…7.29}, density decrease {6…30 %}. 지표 AP_cor = 손상·단계 평균 AP, **RCE = (AP_clean − AP_cor)/AP_clean** | ① RCE 정의 그대로 가져와 R_h·D_det 에 적용. ② 우리 lcl 의 Beer-Lambert α = 0.01·R^0.6 는 5 mm/h → 0.026, 25 mm/h → 0.069, 40 mm/h → 0.091 로 Dong 의 fog 단계 3~5 와 같은 α 범위다. 표에 "Dong 심각도 환산" 열을 넣으면 우리 mid/high 가 문헌에서 어느 단계인지 한눈에 보인다. Dong/Hahner 의 fog 도 같은 e^(−2αr) 감쇠라 α=0.06(5단계, 가시거리 50 m)에서는 그쪽 검출기도 원거리를 잃는다 — 우리 lcl-high 가 27 m 밖을 잃는 것과 같은 체제. ③ lso 의 sector dropout 은 Dong 의 "FOV lost"(각도 범위 축소)·"local density decrease" 와 같은 종류 — 관련 문장에 인용 |
 | **Kong et al., ICCV 2023** "Robo3D" | 8종 손상 × 3단계(fog, wet ground, snow, motion blur, beam missing, crosstalk, incomplete echo, cross-sensor). **기준 모델이 CenterPoint**. mCE(CenterPoint 대비 오류 비), **mRR = 손상 평균 정확도 / 정상 정확도** | ① RR(resilience rate) 를 수준별 정규화 지표로 채택: RR = R_h(수준)/R_h(nf). ② 우리 검출기가 바로 CenterPoint 라서 Robo3D 의 CenterPoint fog/snow/beam-missing 수치를 "외부 참조값"으로 옆에 둘 수 있다 (데이터셋이 달라 절대 비교는 아니고 저하 폭의 크기 감 비교). |
 | **Hahner et al., ICCV 2021** (fog) / CVPR 2022 (snow) — 이미 [58][59] | 물리 기반 fog 시뮬레이션, α ↔ MOR(가시거리) 대응: 0.005→600 m, 0.01→300, 0.02→150, 0.03→100, 0.06→50 m. AP@0.5 IoU(car), 40 recall 포인트, 날씨 분할(clear/light/dense fog)로 보고 | α→가시거리 환산표를 그대로 써서 lcl 각 수준에 "MOR 환산 ≈ xx m" 를 붙인다 (독자가 mm/h 보다 가시거리를 직관적으로 안다). 거리별 분해는 Hahner 도 안 했으므로 우리의 R_h / R_26-50 분해는 추가 기여로 쓸 수 있다 |
 
