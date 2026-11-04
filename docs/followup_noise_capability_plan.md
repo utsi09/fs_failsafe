@@ -94,6 +94,13 @@ actor_id, type, x, y, yaw, len, wid, dist, bearing_deg   # 반경 80 m 안 vehic
 cdr이 호스트에서 라이다 토픽을 구독하고 있으니 호스트에 같은 도메인으로 이미 보인다. 실행당 100~300 MB, 146회 ≈ 30~40 GB (여유 84 GB). 부족하면 bag 대신 CSV 기록기로 바꾼다(`record_ego_path2.py` 확장).
 러너의 케이스 시작/종료 훅에 `ros2 bag record -o results/bag_<CASE_TAG> ...` / SIGINT를 넣는다 (`record_ego_path2.py`를 띄우는 자리와 같은 곳).
 
+### 4-2b. 디스크 감시 (실행 내내)
+146회를 무인으로 돌리는 동안 디스크가 차면 bag이 깨지고 CARLA가 죽는다. 배치 스크립트에 세 겹으로 넣는다.
+- **실행 전 검사**: 케이스마다 시작 전에 `df --output=avail -BG /home`을 읽어 **여유 15 GB 미만이면 배치를 멈추고** `results/DISK_FULL` 파일을 남긴다(러너가 다음 케이스로 넘어가지 않게).
+- **bag 상한**: `ros2 bag record --max-bag-size 400000000`(400 MB)로 한 실행이 폭주해도 400 MB에서 끊는다. 정상 실행은 100~300 MB.
+- **백그라운드 기록**: `watch -n 300 'date; df -h /home | tail -1' >> results/disk_log.txt` 를 배치와 같이 띄워 5분마다 남긴다. 아침에 이 파일만 보면 밤새 추세가 보인다.
+- 시작 전 정리: 지금 여유 84 GB. 146회 × 최대 300 MB = 44 GB가 상한이므로 시작 전에 **여유 60 GB 이상**을 확보한다(`~/autoware_carla_leaderboard/experiments/results/case_logs`의 오래된 gz, docker 이름 없는 이미지 `<none>` 5개 ≈ 70 GB가 후보. 지우기 전에 사용자 확인).
+
 ### 4-3. 러너 옵션 2개
 - `--sev-value "0.2:90"`: SEVERITY 표 대신 이 문자열을 그대로 `fault=t:값`에 넣는다 (`fault_args()` l.189-221).
 - `--t 10` 고정은 이미 있음. `--mrm-off --npc def --reps 3` 조합 사용.
