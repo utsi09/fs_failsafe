@@ -24,7 +24,7 @@ stock 은 러너의 `--mrm-off` 모드다. 원고 5.2절의 "종류당 1회 노�
 
 ## 3. 케이스 종료 규칙 (관찰 모드 judge)
 
-고장 뒤 60 s 이상 정지 → HAZARD_STOPPED, 충돌/차로이탈 → HAZARD_COLLISION/LANE_DEPART, 시나리오 종료 → SCENARIO_ENDED, 고장 뒤 360 s 무사고 → HAZARD_SURVIVED. "정지"가 신호 대기인지 얼어붙음인지는 GT 로거의 신호등 상태 열로 사후에 가른다(아래).
+고장 뒤 60 s 이상 정지 → HAZARD_STOPPED, 충돌/차로이탈 → HAZARD_COLLISION/LANE_DEPART, 시나리오 종료 → SCENARIO_ENDED, 고장 뒤 360 s 무사고 → HAZARD_SURVIVED. "정지"가 신호 대기인지 얼어붙음인지는 GT 로거의 신호등 상태 열로 사후에 가른다(아래). **느리게 기어가는 경우는 judge 가 끊지 않고(정지 문턱 0.15 m/s 미만만 정지로 봄) 시나리오 끝이나 360 s 까지 그대로 기록**되므로, 기어감은 5절의 속도 시계열에서 분류한다.
 
 ## 4. 기록 (케이스마다)
 
@@ -40,7 +40,10 @@ stock 은 러너의 `--mrm-off` 모드다. 원고 5.2절의 "종류당 1회 노�
 
 | 지표 | 정의 | 비교 대상 |
 |---|---|---|
-| 결말 종류 | frozen(정지 ≥ 60 s, Autoware MRM 상태 NORMAL, 신호 대기 아님) / stock_mrm(Autoware 자체 MRM 작동) / drove_on(완주 또는 360 s 생존) / collision / lane_depart | ours 의 DEFER·MOVE, baseline 의 정지 |
+| 결말 종류 | frozen(정지 ≥ 60 s, Autoware MRM 상태 NORMAL, 신호 대기 아님) / **crawl(기어감)** / stutter(멈췄다 가기 반복) / stock_mrm(Autoware 자체 MRM 작동) / drove_on(정상 속도로 완주 또는 360 s 생존) / collision / lane_depart | ours 의 DEFER·MOVE, baseline 의 정지 |
+| **crawl 판정** | 고장 뒤 속도 < 1.0 m/s(정상 4.2 의 1/4)인 구간이 적신호 대기 제외 **누적 30 s 이상**이면서 그동안 2 m 이상 전진 → 기어감. 세부: 저속 구간 누적 시간, 가장 긴 저속 구간, 고장 뒤 평균 속도 / 고장 전 평균 속도 비, 저속 구간 중 전진 거리 | ours 의 저속 캡 3.0 m/s 대피와 대조 (제안은 "느리게라도 목적을 갖고 이동", 순정은 "이유 없이 기어감") |
+| stutter 판정 | 고장 뒤 정지(< 0.15 m/s 2 s 이상) → 재출발 이 3회 이상 반복, 적신호 제외 | 후속차 차단·추돌 위험 |
+| 속도 프로파일 | 고장 뒤 속도 시계열(GT 20 Hz) 그대로 저장 → 그림에 조건별 대표 프로파일 | |
 | t_stop | 고장 → 정지 시작 | ours 의 time_to_stop |
 | 정지 위치 | 교차로 안 / 차로 중간 / 목적지 30 m 내 / 갓길, 차로 점유 길이·비율 | ours DEFER 의 정지 위치 |
 | deg_dist | 고장 뒤 주행 거리 | 캠페인 deg_dist (9~58 m) |
