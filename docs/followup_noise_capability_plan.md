@@ -91,7 +91,33 @@ lcl-high(25 mm/h)가 "근거리만 보였다"는 기억이 맞다: 모델상 27 
 
 논문에서 gn 의 자리: "GNSS 입력 무결성 고장". 감시기의 loc_meas 는 EKF 가 아니라 **GNSS 가 믿을 만한가**를 재고, gn-high 에서 정지로 분기하는 것은 "재초기화·정규화에 쓸 GNSS 를 잃었으니 이동을 포기"하는 보수적 정책이다. Autoware 자체 감시기(localization_error_monitor: EKF 공분산 타원 횡 0.25 m 경고 / 0.3 m 오류, pose_instability_detector)는 GNSS 를 보지 않으므로 이 고장을 못 잡는다 — 5.2절 "gn-high 로 251 m 주행"의 기전.
 
-**선택 블록 B3 (gn 이 EKF 에 들어가면 어떻게 되나, 6회)**: pose_twist_fusion_filter.launch.xml 의 `input_pose_with_cov_name` 을 `/sensing/gnss/pose_with_covariance` 로 바꾼 launch 로 Autoware 를 띄우면 GNSS 가 EKF 의 pose source 가 된다(NDT 출력은 무시됨). gn 1.0·2.5 × 3 회. 결과: e_lat P95 가 σ 에 비례해 커지고 cap_loc 교차와의 관계를 직접 볼 수 있다. 주의: 에이전트 GNSS pose 는 base_link 대비 1.4 m 오프셋이 있어 nf 에서도 차가 차로 안에서 치우칠 수 있다 → 먼저 nf 1회로 정상 주행이 되는지 확인하고, 안 되면 B3 은 뺀다. 이 블록은 "구성 (c) 차량이라면"이라는 가정 아래의 보조 결과로만 쓴다.
+**블록 B3 — Eagleye 로 gn 실험 (GNSS 가 pose source 인 차량 재현)**
+
+GNSS 노이즈가 EKF 에 실제로 들어가는 구성을 보려면 Autoware 공식 GNSS/IMU/차속 측위인 **Eagleye**(`pose_source:=eagleye`)를 쓰는 것이 EKF 입력 remap 꼼수보다 정당하다. 이 PC 상태와 필요한 작업을 확인했다.
+
+이미 있는 것
+- Eagleye 패키지: 호스트 install 과 도커 이미지(`/opt/autoware/eagleye_rt`) 둘 다 있음. `tier4_localization_launch/.../eagleye/eagleye_rt.launch.xml` 포함.
+- 차속 twist: 센서킷 sensing.launch 가 `vehicle_velocity_converter` 로 `/sensing/vehicle_velocity_converter/twist_with_covariance` 를 이미 냄. IMU `/sensing/imu/imu_data` 있음.
+- 파이썬 `pyproj`, `mgrs` 설치돼 있음.
+- Town07.xodr 의 georeference 는 `tmerc lat_0=0 lon_0=0` → Autoware 의 TransverseMercator 투영과 같은 식.
+
+막혀 있는 것 (셋 다 풀어야 함)
+1. **지도 투영이 Local**이다(`awcl_maps/Town07/map_projector_info.yaml: projector_type: Local`). Eagleye 출력은 위경도 → `geo_pose_projector` 가 `geography_utils::project_forward` 로 지도 좌표로 바꾸는데, 이 함수는 Local 이면 `invalid_argument` 를 던진다(lanelet2_projector.cpp:65). → `projector_type: TransverseMercator, map_origin 0/0/0` 으로 바꿔야 한다.
+2. 투영을 바꾸면 map_loader 가 OSM 노드의 **lat/lon 을 읽는데 지금 OSM 은 lat="" lon="" 이고 local_x/local_y 태그만 있다**(Local 일 때만 local_x/y 를 덮어씀, map_loader_node.cpp:140-162). → 스크립트로 전체 노드에 lat/lon 을 채운다: local_x/y → pyproj tmerc(0,0) 역변환, 소수 10자리. 복사본 `lanelet2_map_tmerc.osm` 로 만들고 원본은 둔다. PCD 는 그대로.
+3. 에이전트가 **NavSatFix 와 GNSS 속도를 안 낸다**(PoseWithCovariance 만 냄). → aw_e2e.py 에 두 발행 추가: GT base_link 위치에 gn 노이즈(m)를 더한 뒤 같은 tmerc 로 위경도 변환해 `NavSatFix`, GT 속도(ENU)에 노이즈를 더해 `TwistWithCovarianceStamped`. eagleye_config 는 `velocity_source_type: 3`(TwistWithCovarianceStamped), `llh_source_type: 2`(NavSatFix) 와 토픽명, `imu_rate`, `reverse_imu_wz` 확인.
+
+실행: `e2e_simulator.launch.xml pose_source:=eagleye twist_source:=eagleye`(NDT 꺼짐). Eagleye 는 수렴 시간이 있다: heading 최소 10 s, yaw_rate_offset 최소 30 s, velocity_scale_factor 최소 20 s 의 주행 데이터가 필요 → 고장 주입은 **t=45 s 이후**, 경로 초반이 직선이어야 한다(dg 기본 경로 확인).
+
+매트릭스 (Eagleye 블록, 18회 ≈ 2 h)
+| 고장 | 수준 | rep | 실행 |
+|---|---|---|---|
+| nf (Eagleye) | – | 3 | 3 |
+| gn | 0.5, 1.0, 2.5, 5.0 | 3 | 12 |
+| gm (Gauss-Markov 편향) | 3.0:30 | 3 | 3 |
+
+지표는 B 블록과 같다(e_lat P95, ATE, S_loc). Eagleye 는 GNSS 사이를 IMU·차속 추측항법으로 메우므로 **gn σ 에 비해 EKF 오차가 꽤 작게 나올 수 있다**. 그러면 "GNSS 기반 차량에서는 gn-high 정지 분기가 과보수적"이라는 결과가 되는데, 그것도 논문에 쓸 수 있는 정직한 결론이다(감시기가 입력 무결성 기준으로 보수적이라는 것과 EKF 가 실제로 버틴다는 것은 양립한다).
+
+시간 상자: 지도 변환·에이전트 발행·설정·nf 수렴 확인까지 **하루**. 하루 안에 nf 에서 Eagleye 가 수렴해 차로 안을 정상 주행하지 못하면 B3 은 **EKF 입력 remap 판**(`pose_twist_fusion_filter.launch.xml` 의 `input_pose_with_cov_name` → `/sensing/gnss/pose_with_covariance`, 반나절)으로 내려가고, 논문에는 "느슨결합 GNSS/INS 대용"이라고 이름 붙인다. 이 블록은 본 매트릭스(146회) 가 끝난 뒤에 한다.
 
 ## 4. 기록할 것 (추가할 코드 4개)
 
@@ -206,7 +232,8 @@ EKF(`kinematic_state`) vs GT. 고정 오프셋(≈1.4 m)은 각 실행의 고장
 | 1일 밤 | 순서 1~4 배치(115회 ≈ 12 h) 무인 실행 | bag 115개 |
 | 2일 | 오전: 순서 5~7(31회) 이어서 실행 + 분석기 완성. 오후: 밤 데이터 1차 그림 | 표 5.6 초안 |
 | 3일 | 전체 분석, 그림 2장, 표 2개, 5.8절·3.2절 C 보강·6.4절 한계 문장 | 논문 패치 |
-| 4일 (예비) | 깨진 실행·경계 수준 보충(rep 8), 리뷰 | |
+| 4일 | B3 Eagleye 준비(지도 투영 변환, NavSatFix/속도 발행, 설정) + nf 수렴 확인. 안 되면 remap 판으로 전환 | |
+| 5일 | B3 실행 18회(2 h) + 분석. 깨진 실행·경계 수준 보충(rep 8), 리뷰 | |
 
 ## 10. 위험과 대비
 
