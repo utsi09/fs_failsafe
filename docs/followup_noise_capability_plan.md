@@ -25,7 +25,7 @@
    - NDT의 GNSS 정규화는 꺼져 있음 (`ndt_scan_matcher.param.yaml:40-41`, `enable: false`).
    - gn은 `/sensing/gnss/pose_with_covariance`만 더럽힌다 (`aw_e2e.py:977-991`). 에이전트의 `_ndt_pose_pub`(l.106)은 선언만 있고 발행 안 함.
    - 기존 데이터도 같은 얘기: `results/ego_path_gnmid.csv`에서 GNSS-EKF 잔차는 0.7~2.8 m로 흔들리는데 EKF 자체의 샘플 간 최대 이동은 0.21 m. EKF가 1 m 노이즈를 따라가지 않는다. mrm-off에서 gn-high로도 251 m를 멀쩡히 달린 것(5.2절)이 그 결과다.
-   - **의미**: 논문의 "gn: Gaussian position noise (EKF input)"라는 표현은 정확히는 "GNSS 입력 노이즈"다. 내 loc_meas 채널(GNSS vs EKF 잔차)은 **입력 무결성**을 재는 것이지 EKF 저하를 재는 게 아니다. 이건 약점이 아니라 정리해서 써야 할 사실이다. gn-high에서 정지로 분기하는 건 "EKF가 망가져서"가 아니라 "GNSS를 믿을 수 없는 상태에서 이동을 보수적으로 포기"한 것이다. 실험 B에 gn 3회를 **영(null) 대조**로 넣어 EKF 오차가 안 변함을 수치로 보이고, 이 문장을 논문 3.2절 C와 6.4절에 추가한다.
+   - 따라서 GNSS 오차에 따른 측위 성능 변화는 GNSS 가 pose source 인 구성(B3, Eagleye)에서 잰다. 본 매트릭스의 B0(gn)은 참고용.
    - 라이브 확인 명령 (Autoware 떠 있을 때):
      ```
      ros2 topic info -v /localization/pose_estimator/pose_with_covariance   # 발행자가 ndt_scan_matcher 인지
@@ -89,11 +89,9 @@ lcl-high(25 mm/h)가 "근거리만 보였다"는 기억이 맞다: 모델상 27 
 
 그러므로 주행 중 gn 은 Autoware 의 EKF·계획·제어에 **아무 영향이 없다**. 영향이 있는 경우는 (a) NDT 가 무너져 재초기화할 때 → 2.5 m 틀린 자리에서 NDT 를 다시 맞추기 시작해 엉뚱한 곳에 수렴할 수 있음, (b) GNSS 정규화를 켠 설정, (c) GNSS/INS 가 pose source 인 차량(PCD 맵 없이 RTK 로 측위하는 경우) → 그때는 EKF 에 바로 들어가 위치가 튀고 경로·제어가 흔들린다. 실차(아이오닉6, RTK GPS)가 (c) 구성이면 gn 은 가장 직접적인 고장이다.
 
-논문에서 gn 의 자리: "GNSS 입력 무결성 고장". 감시기의 loc_meas 는 EKF 가 아니라 **GNSS 가 믿을 만한가**를 재고, gn-high 에서 정지로 분기하는 것은 "재초기화·정규화에 쓸 GNSS 를 잃었으니 이동을 포기"하는 보수적 정책이다. Autoware 자체 감시기(localization_error_monitor: EKF 공분산 타원 횡 0.25 m 경고 / 0.3 m 오류, pose_instability_detector)는 GNSS 를 보지 않으므로 이 고장을 못 잡는다 — 5.2절 "gn-high 로 251 m 주행"의 기전.
-
 **블록 B3 — Eagleye 로 gn 실험 (GNSS 가 pose source 인 차량 재현)**
 
-GNSS 노이즈가 EKF 에 실제로 들어가는 구성을 보려면 Autoware 공식 GNSS/IMU/차속 측위인 **Eagleye**(`pose_source:=eagleye`)를 쓰는 것이 EKF 입력 remap 꼼수보다 정당하다. 이 PC 상태와 필요한 작업을 확인했다.
+**결정(2026-11-04): GNSS 오차 → 측위 성능 변화는 이 블록 하나로 넣는다.** GNSS 가 EKF 에 들어가는 구성은 Autoware 공식 GNSS/IMU/차속 측위 **Eagleye**(`pose_source:=eagleye`)로 만든다. 이 PC 상태와 필요한 작업:
 
 이미 있는 것
 - Eagleye 패키지: 호스트 install 과 도커 이미지(`/opt/autoware/eagleye_rt`) 둘 다 있음. `tier4_localization_launch/.../eagleye/eagleye_rt.launch.xml` 포함.
@@ -115,9 +113,9 @@ GNSS 노이즈가 EKF 에 실제로 들어가는 구성을 보려면 Autoware �
 | gn | 0.5, 1.0, 2.5, 5.0 | 3 | 12 |
 | gm (Gauss-Markov 편향) | 3.0:30 | 3 | 3 |
 
-지표는 B 블록과 같다(e_lat P95, ATE, S_loc). Eagleye 는 GNSS 사이를 IMU·차속 추측항법으로 메우므로 **gn σ 에 비해 EKF 오차가 꽤 작게 나올 수 있다**. 그러면 "GNSS 기반 차량에서는 gn-high 정지 분기가 과보수적"이라는 결과가 되는데, 그것도 논문에 쓸 수 있는 정직한 결론이다(감시기가 입력 무결성 기준으로 보수적이라는 것과 EKF 가 실제로 버틴다는 것은 양립한다).
+지표는 B 블록과 같다(e_lat P95, ATE, S_loc). Eagleye 는 GNSS 사이를 IMU·차속 추측항법으로 메우므로 **gn σ 에 비해 EKF 오차가 꽤 작게 나올 수 있다**. 그 경우도 결과 그대로 보고한다.
 
-시간 상자: 지도 변환·에이전트 발행·설정·nf 수렴 확인까지 **하루**. 하루 안에 nf 에서 Eagleye 가 수렴해 차로 안을 정상 주행하지 못하면 B3 은 **EKF 입력 remap 판**(`pose_twist_fusion_filter.launch.xml` 의 `input_pose_with_cov_name` → `/sensing/gnss/pose_with_covariance`, 반나절)으로 내려가고, 논문에는 "느슨결합 GNSS/INS 대용"이라고 이름 붙인다. 이 블록은 본 매트릭스(146회) 가 끝난 뒤에 한다.
+시간 상자: 지도 변환·에이전트 발행·설정·nf 수렴 확인까지 **하루**. 하루 안에 nf 에서 Eagleye 가 수렴해 차로 안을 정상 주행하지 못하면 B3 은 **EKF 입력 remap 판**(`pose_twist_fusion_filter.launch.xml` 의 `input_pose_with_cov_name` → `/sensing/gnss/pose_with_covariance`, 반나절)으로 내려간다. 이 블록은 본 매트릭스(146회) 가 끝난 뒤에 한다.
 
 ## 4. 기록할 것 (추가할 코드 4개)
 
@@ -170,7 +168,7 @@ cdr이 호스트에서 라이다 토픽을 구독하고 있으니 호스트에 �
 
 ### 실험 A (인지) — 실행당 요약값
 전방 섹터(ego 기준 ±45°, lso 폭 90°와 일치)·고장 후 구간만.
-참고: 내 cdr의 공간-시간 TTC 창은 6 s(`awcl_adapter.py` TTC_HORIZON_S)로 Autoware의 5 s보다 1 s 길다. 감시기가 계획기보다 한 박자 먼저 본다는 근거로 3.4절에 한 줄 추가.
+참고: 내 cdr의 공간-시간 TTC 창은 6 s(`awcl_adapter.py` TTC_HORIZON_S)로 Autoware의 5 s보다 1 s 길다. 
 
 | 지표 | 정의 | 왜 |
 |---|---|---|
@@ -250,8 +248,6 @@ EKF(`kinematic_state`) vs GT. 고정 오프셋(≈1.4 m)은 각 실행의 고장
 
 - **lso-mid가 R_h·D_det를 지키면**: "The tolerance of lso-mid is consistent with measured detector capability: recall within 30 m remained within x %p of fault-free and the effective detection range was y m, whereas the first level at which the perception score crossed θ_H coincided with a z %p recall drop. The score threshold therefore sits at or before the onset of capability loss."
 - **못 지키면**: "The quality channel under-reacts to sparsification: at T=0.33 recall within 30 m had already fallen by x %p while the score stayed above θ_H. The continued driving under lso-mid in Table 5.2 is thus a detector blind spot, not a design choice; the count/far channels should be re-weighted (future work)."
-- **gn에 대해 (어느 경우든)**: "GNSS position noise does not propagate to the EKF in the evaluated configuration (NDT pose source, GNSS regularization disabled): EKF lateral error under gn-high was indistinguishable from fault-free. The localization residual channel therefore monitors input integrity rather than estimator degradation, and the gn-high deferral is a conservative policy on untrusted input, not a response to measured estimator error."
-
 ## 12. 참고 위치 (이 PC)
 
 - 주입 코드: `~/autoware_carla_leaderboard/src/tum_agents/autoware_agent/aw_e2e.py` (lso l.675-690, lcl l.694-710, imn l.714/1058-1080, gn l.977-991), 브리지 물리: `src/autoware_carla_cpp_bridge/.../lidar_bridge.cpp:161-251`
@@ -279,7 +275,7 @@ EKF(`kinematic_state`) vs GT. 고정 오프셋(≈1.4 m)은 각 실행의 고장
 | 문헌 | 방법 | 우리가 빌리는 것 |
 |---|---|---|
 | **Bijelic, Gruber, Ritter, IV 2018** — [20] | 안개 챔버, 가시거리 V = 45/36/24/13 m, 반사율 5/50/90 % 표적. 지표 **d_max = 표적 위 마지막 가시 점까지 거리**, 깊이 구간별 점 수. 결론 "가시거리 40 m 아래면 인지 25 m 미만" | D_det 는 d_max 의 "검출기 수준" 판 — 점이 아니라 **검출기가 객체로 인식한 첫 거리**. 이 대응을 지표 정의문에 한 줄로 쓴다. 저하 수준 대 유효거리 곡선(우리 Fig 5.5a)의 형식 선례 |
-| **Kim, Park, Kim, Sensors 2023** — [23] | 실도로(KICT 기상재현도로), 비 10/20/30/40 mm/h, 안개 가시거리 50/100/150 m, 거리 10~50 m, 재질 5종, **셀당 5회 반복**, 지표 NPC(표적 점 수)·intensity, **유효 관측 5회 미만이면 "non-observation"**, 일원 ANOVA + Tukey HSD. 결과: 40 mm/h·안개 50 m 에서 20~30 m 부터 비관측, NPC 최대 −56 %, intensity 최대 −73 % | ① 셀당 5회 반복이 선례가 있다 → 우리 rep 5 의 근거. ② "non-observation" 정의를 빌려 D_det 산출 불가 셀을 같은 용어로 표기. ③ 우리 lcl 40 mm/h 결과를 이 논문의 "40 mm/h 에서 20~30 m 비관측"과 대조하는 문장 하나 (시뮬레이션 클러터 모델의 현실성 점검). ④ 통계는 ANOVA 대신 실행 단위 Spearman·부트스트랩을 쓰되, 그 이유(프레임 비독립, 단조성 질문)를 4.7절에 한 줄 |
+| **Kim, Park, Kim, Sensors 2023** — [23] | 실도로(KICT 기상재현도로), 비 10/20/30/40 mm/h, 안개 가시거리 50/100/150 m, 거리 10~50 m, 재질 5종, **셀당 5회 반복**, 지표 NPC(표적 점 수)·intensity, **유효 관측 5회 미만이면 "non-observation"**, 일원 ANOVA + Tukey HSD. 결과: 40 mm/h·안개 50 m 에서 20~30 m 부터 비관측, NPC 최대 −56 %, intensity 최대 −73 % | ① 셀당 5회 반복이 선례가 있다 → 우리 rep 5 의 근거. ② "non-observation" 정의를 빌려 D_det 산출 불가 셀을 같은 용어로 표기. ③ 우리 lcl 40 mm/h 결과를 이 논문의 "40 mm/h 에서 20~30 m 비관측"과 대조하는 문장 하나 (시뮬레이션 클러터 모델의 현실성 점검). ④ 통계는 ANOVA 대신 실행 단위 Spearman·부트스트랩(프레임 비독립, 단조성 질문) |
 | Goodin 2019 [53], Kilic LISA 2021 [54], Trierweiler 2019 [55] | 이미 lcl/lso 모델의 출처 | 변경 없음. 스윕 값(mm/h, T)이 이 모델들의 입력이라는 점만 재확인 |
 
 ### 13-3. "감시 신호가 실제 검출 성능을 맞히는가" — 런타임 모니터링 계열 (논문 2.5절에 추가할 갈래)
@@ -287,7 +283,7 @@ EKF(`kinematic_state`) vs GT. 고정 오프셋(≈1.4 m)은 각 실행의 고장
 | 문헌 | 방법 | 우리가 빌리는 것 |
 |---|---|---|
 | **Rahman, Sünderhauf, Dayoub, WACV Workshops 2021** "Per-frame mAP prediction for continuous performance monitoring of object detection during deployment" | 정답 없이 검출기 내부 특징으로 **프레임별 mAP 가 임계값 λ(k 퍼센타일 또는 0.5) 아래인지** 예측. 평가는 AUROC/AUPRC, **true warning rate**(저하 프레임 중 경보 비율), 위험회피 점수 | **우리 7절의 AUROC 분석이 이 틀이다.** 다른 점: 그들은 검출기 내부 활성값, 우리는 센서 물리 채널(σ, 점 수, 클러터)로 예측 → "검출기와 독립적인 신호로 같은 일을 한다"고 자리매김. 저하 라벨 정의(R_h 가 nf − 10 %p 아래)를 그들의 λ 와 같은 역할로 설명 |
-| Rahman, Corke, Dayoub, IEEE Access 2021 "Run-time monitoring of machine learning for robotic perception: a survey of emerging trends" | 런타임 모니터링 분류 체계 | 2.5절에 "performance monitoring" 갈래를 소개하는 인용. 우리 감시기가 그 분류의 어디(입력 수준 모니터)인지 한 줄 |
+| Rahman, Corke, Dayoub, IEEE Access 2021 "Run-time monitoring of machine learning for robotic perception: a survey of emerging trends" | 런타임 모니터링 분류 체계 | 런타임 모니터링 분류 체계 인용용 |
 | Yatbaz et al., CVPR Workshops 2024 "Run-time monitoring of 3D object detection in automated driving systems" | KITTI/nuScenes, **PointPillars·CenterPoint** 의 활성 패턴으로 3D 검출 오류 예측 | 3D·CenterPoint 로 같은 질문을 다룬 가장 가까운 선행. 우리와의 차이(폐루프 스택, 물리 채널)만 적고 수치 비교는 안 함 |
 
 ### 13-4. 측위
@@ -296,16 +292,10 @@ EKF(`kinematic_state`) vs GT. 고정 오프셋(≈1.4 m)은 각 실행의 고장
 |---|---|---|
 | **Reid et al., SAE Int. J. CAV 2019** — [29] | 차량 측위 요구치: 로컬도로 횡 0.29 m(95 % 0.10 m)·종 0.29 m·자세 0.50°, 고속도로 횡 0.57 m(0.20 m) | 표 5.7 에 0.29 m / 0.57 m 두 선을 긋고 우리 0.5 m 가 그 사이임을 보인다. cap_loc 0.5 교차점이 0.29 m 교차점보다도 앞서면 "엄격 기준으로도 보수적", 0.57 m 보다만 앞서면 "고속도로 기준으로 보수적" 으로 등급을 나눠 서술 |
 | **Sturm et al., IROS 2012** (TUM RGB-D benchmark) | ATE(정렬 후 절대 궤적 오차 RMSE), RPE(구간 상대 오차 = 드리프트) | EKF 대 GT 를 ATE(오프셋 정렬 후 RMSE·P95)로, imn/imb 드리프트는 RPE(1 s 구간)로 보고. `evo` 도구 그대로 사용 가능 |
-| Autoware `ndt_scan_matcher` 문서 / Autoware Discussion #5628, #5135 | NVTL 임계 2.3(converged_param). **점수가 낮으면 NDT 가 pose 발행을 멈추고 EKF 는 속도로 추측항법**. 실도로 사례에서 NVTL 이 측위 붕괴를 못 잡은 보고(#5135) | ① "NDT 발행률" 지표의 근거. ② NVTL 만으로는 부족하니 GT 오차로 직접 재야 한다는 논거(4.9절 설계 동기). ③ lso-high 에서 EKF 오차가 커지는 기전 설명 |
+| Autoware `ndt_scan_matcher` 문서 / Autoware Discussion #5628, #5135 | NVTL 임계 2.3(converged_param). **점수가 낮으면 NDT 가 pose 발행을 멈추고 EKF 는 속도로 추측항법**. 실도로 사례에서 NVTL 이 측위 붕괴를 못 잡은 보고(#5135) | ① "NDT 발행률" 지표의 근거. ② NVTL 만으로는 부족하니 GT 오차로 직접 잰다. ③ lso-high 에서 EKF 오차가 커지는 기전 설명 |
 | **Burnett et al., RA-L 2022** "Are we ready for radar to replace lidar in all-weather mapping and localization?" (Boreas) | 1년 반복 주행, 눈보라에서도 LiDAR 측위가 최고 정확도. "중간 강수에 대한 LiDAR 측위 민감도는 과장돼 왔다" | H7 의 사전 기대. lcl-mid 에서 NDT 가 안 흔들리면 이 보고와 일치한다고 쓴다 |
 | **Matos, Durães, Cunha, Informatics 2025** "Simulating the effects of sensor failures on autonomous vehicles for safety evaluation" | CARLA + Autoware, ROS 브리지에서 LiDAR/GNSS/IMU 고장 주입, 주행 결과(충돌·이상 거동)로 평가 | 2.6절의 가장 가까운 동시대 연구. 차이: 그들은 주행 결과, 우리는 **인지·측위 능력 자체와 감시 점수의 대응**을 잰다 |
 
 ### 13-5. 지표 정의의 출처 (한 줄씩)
 - 중심거리 매칭(IoU 대신), 임계 {0.5, 1, 2, 4} m, TP 지표는 2 m: **Caesar et al., CVPR 2020 (nuScenes)**. 우리 2.0 m(주)·4.0 m(민감도)의 근거.
 - 거리 구간별 분해 [0, 30), [30, 50), [50, ∞): **Sun et al., CVPR 2020 (Waymo Open Dataset)** 의 관례(공식은 35 m 경계, 논문들은 30 m). 우리는 26/50 m 로 자르되 "Waymo 식 거리 구간 분해"라고 소개.
-
-### 13-6. 논문에 넣는 위치
-- 2.3절 끝에 한 단락: 손상 강건성 벤치마크(Dong, Kong)와 실측 열화(Bijelic, Kim)는 **검출기 성능**을 재고, 2.5절의 런타임 모니터링(Rahman, Yatbaz)은 **그 성능을 정답 없이 예측**한다. 본 연구의 추가 실험은 둘을 잇는다: 물리 채널 점수가 폐루프 스택의 실제 검출·측위 능력을 얼마나 추적하는지.
-- 4.9절 "Capability-correlation experiment design": 매트릭스, 지표(R_h, D_det, FP/s, RR/RCE, ATE, NDT 발행률), 라벨 정의, AUROC.
-- 5.8절 결과 + Table 5.6/5.7 + Fig 5.5.
-- 6.4절 한계: 단일 검출기(CenterPoint tiny)·단일 맵·시뮬레이션 클러터 모델, Kim 2023 과의 정성 대조만 가능.
