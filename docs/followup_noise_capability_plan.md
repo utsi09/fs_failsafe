@@ -117,12 +117,13 @@ cdr이 호스트에서 라이다 토픽을 구독하고 있으니 호스트에 �
 
 ### 실험 A (인지) — 실행당 요약값
 전방 섹터(ego 기준 ±45°, lso 폭 90°와 일치)·고장 후 구간만.
+참고: 내 cdr의 공간-시간 TTC 창은 6 s(`awcl_adapter.py` TTC_HORIZON_S)로 Autoware의 5 s보다 1 s 길다. 감시기가 계획기보다 한 박자 먼저 본다는 근거로 3.4절에 한 줄 추가.
 
 | 지표 | 정의 | 왜 |
 |---|---|---|
-| **R30** | GT 차량이 0~30 m에 있는 프레임 중 검출 객체가 2.5 m 안에 있는 비율 | 1차 종점. 30 m = 4.2 m/s 기준 약 7 s 앞, 계획기가 감속 판단에 쓰는 거리. 정지거리(8.8 m)보다 충분히 멀고, 정상에서 centerpoint가 거의 100 % 잡는 구간이라 하락분을 노이즈 탓으로 돌릴 수 있다. (8 m 돌발 대응은 거리가 아니라 감지 지연 문제라 5.4~5.6절이 다룬다) |
-| R50 | 30~50 m 구간 같은 정의 | 55 m 유효거리 주장 검증 |
-| **D_det** | 각 GT 차량에 접근하면서 "3프레임 연속 검출"이 처음 성립한 거리의 중앙값 | 유효 검출거리. 논문의 "lso-mid ≈ 55 m, high ≈ 12 m" 직접 검증 |
+| **R_h** (horizon recall) | GT 차량이 0~**26 m**에 있는 프레임 중 검출 객체가 2.5 m 안에 있는 비율 | 1차 종점. 26 m = 제한속도 4.17 m/s × **Autoware 충돌 검사 창 5 s** + 정지 여유 5 m. 5 s는 이 설정의 obstacle_cruise `dense_time_horizon`(5.0), dynamic_obstacle_stop `time_horizon`(5.0), MPC 예측 궤적(50 step × 0.1 s)이 공통으로 쓰는 값이고, 5 m는 obstacle_stop `stop_margin`. 즉 "Autoware가 충돌 판단에 쓰는 구간 안에서 보느냐". 속도에 따라 창을 바꾸지 않는 이유: 고장 상태에서 느려지면 창이 줄어 검출률이 좋아 보이는 착시가 생기므로 제한속도 기준 고정. (8 m 돌발 대응은 거리가 아니라 감지 지연 문제라 5.4~5.6절이 다룬다) |
+| R_26-50 | 26~50 m 구간 같은 정의 | 55 m 유효거리 주장 검증. 정상에서도 원거리는 놓치기 시작하므로 보조 |
+| **D_det** | 각 GT 차량에 접근하면서 "3프레임 연속 검출"이 처음 성립한 거리의 중앙값 | 유효 검출거리. 논문의 "lso-mid ≈ 55 m, high ≈ 12 m" 직접 검증. 기준 40 m ≈ 1.5 × 26 m: 판단 창에 들어오기 전에 3프레임 확정(0.3 s)과 트래킹 지연을 치를 여유 |
 | FP/s | GT 4 m 안에 없는 검출 객체 수 / 초 | lcl 유령 객체 (mech_objects.log의 그 현상) |
 | e_pos | 매칭된 객체 중심 오차 중앙값 | 보조 |
 | **S_lidar** | 고장 후 `/monitor/scores` LIDAR_front quality_score 중앙값 | 내 점수 |
@@ -144,10 +145,10 @@ EKF(`kinematic_state`) vs GT. 고정 오프셋(≈1.4 m)은 각 실행의 고장
 
 ## 6. 사전 등록 가설 (데이터 보기 전에 적어 두는 것)
 
-- **H1 (단조성)** lso T↓, lcl 강우↑에 따라 R30·D_det 비증가, S_lidar·S_perc 비증가. 실행 단위 Spearman ρ(수준, R30) < 0, ρ(S_perc, R30) > 0.
-- **H2 (lso-mid 허용의 정당성)** T=0.33에서 R30이 nf 대비 10 %p 이내(동등성 여유 10 %p, 짝 비교 5쌍 모두). D_det ≥ 40 m. 이 둘이 성립하면 "허용은 설계 의도대로"이고, 깨지면 "품질 채널이 둔감했다"로 논문을 고친다.
-- **H3 (개입 문턱의 위치)** S_perc가 0.7 아래로 내려가는 첫 수준에서 R30이 nf 대비 유의하게(짝 5쌍 모두 하락, 중앙값 −20 %p 이상) 떨어진다. 즉 0.7은 "못 보기 시작하는 지점"과 같은 수준에 있거나 그보다 앞선다(보수적).
-- **H4 (lcl은 FP)** lcl에서 R30 저하보다 FP/s 증가가 먼저 온다. 점수의 clutter 채널이 FP/s와 ρ < 0.
+- **H1 (단조성)** lso T↓, lcl 강우↑에 따라 R_h·D_det 비증가, S_lidar·S_perc 비증가. 실행 단위 Spearman ρ(수준, R_h) < 0, ρ(S_perc, R_h) > 0.
+- **H2 (lso-mid 허용의 정당성)** T=0.33에서 R_h이 nf 대비 10 %p 이내(동등성 여유 10 %p, 짝 비교 5쌍 모두). D_det ≥ 40 m. 이 둘이 성립하면 "허용은 설계 의도대로"이고, 깨지면 "품질 채널이 둔감했다"로 논문을 고친다.
+- **H3 (개입 문턱의 위치)** S_perc가 0.7 아래로 내려가는 첫 수준에서 R_h이 nf 대비 유의하게(짝 5쌍 모두 하락, 중앙값 −20 %p 이상) 떨어진다. 즉 0.7은 "못 보기 시작하는 지점"과 같은 수준에 있거나 그보다 앞선다(보수적).
+- **H4 (lcl은 FP)** lcl에서 R_h 저하보다 FP/s 증가가 먼저 온다. 점수의 clutter 채널이 FP/s와 ρ < 0.
 - **H5 (gn 영 대조)** gn 0.5~5.0 전 구간에서 e_lat P95, e_pos RMSE가 nf와 구별되지 않는다(차이 < 0.1 m). 반면 GNSS 잔차 기반 S_loc은 0.5 아래로 내려간다. → "loc 채널은 입력 무결성 지표"라는 문장을 확정.
 - **H6 (imn)** σ↑에 따라 e_yaw P95·e_lat P95 단조 증가. S_loc(IMU bias 채널 포함 cap_loc)이 0.5를 지나는 σ가, e_lat P95가 0.5 m를 넘는 σ **이하**다(점수가 먼저 반응 = 보수적). 아니면 "점수가 늦다"로 기록.
 - **H7 (lso/lcl → NDT)** lso T≤0.12 또는 lcl ≥25에서 NDT NVTL 저하·e_pos 증가. 이것이 5.3절 "empty-point-cloud freeze"의 측위 측면 설명이 된다.
@@ -161,10 +162,10 @@ EKF(`kinematic_state`) vs GT. 고정 오프셋(≈1.4 m)은 각 실행의 고장
 
 ## 8. 그림·표 (논문 5.8절)
 
-- **Fig 5.5** 2×2: (a) R30·D_det vs T (lso), (b) R30·FP/s vs 강우(lcl), (c) S_perc vs R30 산점 (실행 단위, 0.7/0.3 선), (d) 실행당 e_lat P95 vs imn σ와 S_loc (0.5 선).
-- **Table 5.6** 수준별 R30 / D_det / FP/s / S_lidar / S_perc / 결정 밴드(NORMAL·DEGRADED·CRITICAL).
+- **Fig 5.5** 2×2: (a) R_h·D_det vs T (lso), (b) R_h·FP/s vs 강우(lcl), (c) S_perc vs R_h 산점 (실행 단위, 0.7/0.3 선), (d) 실행당 e_lat P95 vs imn σ와 S_loc (0.5 선).
+- **Table 5.6** 수준별 R_h / D_det / FP/s / S_lidar / S_perc / 결정 밴드(NORMAL·DEGRADED·CRITICAL).
 - **Table 5.7** 수준별 e_lat P95 / e_pos RMSE / NVTL / S_loc / 이동 가능 여부(0.5 m 기준) — gn 두 줄은 "EKF 불변" 행.
-- 본문: "점수가 0.7을 넘는 수준에서는 R30이 nf의 ±x %p, D_det ≥ y m였고, 0.7 아래로 내려간 첫 수준부터 R30이 z %p 떨어졌다" 식으로 숫자 채움. 한계: 단일 맵·단일 검출기(centerpoint tiny)·셀당 n=3.
+- 본문: "점수가 0.7을 넘는 수준에서는 R_h이 nf의 ±x %p, D_det ≥ y m였고, 0.7 아래로 내려간 첫 수준부터 R_h이 z %p 떨어졌다" 식으로 숫자 채움. 한계: 단일 맵·단일 검출기(centerpoint tiny)·셀당 n=3.
 
 ## 9. 일정 (3~4일)
 
@@ -180,8 +181,8 @@ EKF(`kinematic_state`) vs GT. 고정 오프셋(≈1.4 m)은 각 실행의 고장
 
 | 위험 | 대비 |
 |---|---|
-| lso T≤0.12 / lcl 40에서 NDT가 깨져 Autoware가 스스로 서 버림(5.3절 freeze) | 그것도 데이터다(t_selfstop, R30은 멈추기 전 구간). 다만 전방 차량 표본이 줄어드니 D_det는 "측정 불가"로 표기 |
-| def 교통이 전방 30 m 안에 잘 안 들어옴 → R30 표본 부족 | 스모크에서 GT 로그로 30 m 내 프레임 수 확인. 부족하면 `npcadd`로 선행차 추가 또는 `cfl` 계열 선행차 스폰 코드 재사용(정차 차량 2대를 경로 옆에 고정 스폰) |
+| lso T≤0.12 / lcl 40에서 NDT가 깨져 Autoware가 스스로 서 버림(5.3절 freeze) | 그것도 데이터다(t_selfstop, R_h은 멈추기 전 구간). 다만 전방 차량 표본이 줄어드니 D_det는 "측정 불가"로 표기 |
+| def 교통이 전방 30 m 안에 잘 안 들어옴 → R_h 표본 부족 | 스모크에서 GT 로그로 30 m 내 프레임 수 확인. 부족하면 `npcadd`로 선행차 추가 또는 `cfl` 계열 선행차 스폰 코드 재사용(정차 차량 2대를 경로 옆에 고정 스폰) |
 | bag 기록이 Autoware 성능에 영향 | 포인트클라우드 제외, 객체·pose 토픽만(수 KB/s). 영향 없음 |
 | 에이전트 안 GT 로깅이 틱을 느리게 함 | 20 Hz × 액터 20대 CSV 쓰기는 ms 단위. 버퍼링 후 100틱마다 flush |
 | rep 5로도 경계 수준 결론이 흔들림 | 사전 등록 가설·동등성 여유 명시. 경계 수준만 rep 8로 보충(+3회/수준) |
@@ -189,7 +190,7 @@ EKF(`kinematic_state`) vs GT. 고정 오프셋(≈1.4 m)은 각 실행의 고장
 
 ## 11. 논문에 들어갈 문장 (결과에 따라 고르는 두 갈래)
 
-- **lso-mid가 R30·D_det를 지키면**: "The tolerance of lso-mid is consistent with measured detector capability: recall within 30 m remained within x %p of fault-free and the effective detection range was y m, whereas the first level at which the perception score crossed θ_H coincided with a z %p recall drop. The score threshold therefore sits at or before the onset of capability loss."
+- **lso-mid가 R_h·D_det를 지키면**: "The tolerance of lso-mid is consistent with measured detector capability: recall within 30 m remained within x %p of fault-free and the effective detection range was y m, whereas the first level at which the perception score crossed θ_H coincided with a z %p recall drop. The score threshold therefore sits at or before the onset of capability loss."
 - **못 지키면**: "The quality channel under-reacts to sparsification: at T=0.33 recall within 30 m had already fallen by x %p while the score stayed above θ_H. The continued driving under lso-mid in Table 5.2 is thus a detector blind spot, not a design choice; the count/far channels should be re-weighted (future work)."
 - **gn에 대해 (어느 경우든)**: "GNSS position noise does not propagate to the EKF in the evaluated configuration (NDT pose source, GNSS regularization disabled): EKF lateral error under gn-high was indistinguishable from fault-free. The localization residual channel therefore monitors input integrity rather than estimator degradation, and the gn-high deferral is a conservative policy on untrusted input, not a response to measured estimator error."
 
